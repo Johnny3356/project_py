@@ -1,0 +1,4 @@
+LEF檔 : component的type資訊(SRAM找不到?沒用?)
+techlef : LAYER的資訊
+LIB檔 : 各種type的delay和power資訊
+.tcl : evaluate的指定檔

@@ -1,0 +1,27 @@
+PINS : 只有IN OUT 
+nodes : 每一個component，包含PINS
+
+aes_cipher_top.def : 全都有						應該不用
+aes_cipher_top.ref.def : 全都有，當作結果比較參考
+aes_cipher_top.fp.def : 只有PINS
+aes_cipher_top.cells.def : 只有components
+
+aes_cipher_top.nodes : 每一個node的長寬和是否固定			要
+
+aes_cipher_top.pl : 每一個node的位置					要
+
+
+
+aes_cipher_top.scl : 每一個row和sites的資訊(建立grid)			要
+
+
+
+aes_cipher_top.sdc : 每一個PIN的delay和slew				要
+
+aes_cipher_top.lef : LAYER、VIA、MACRO的基本資訊			不用
+
+
+
+aes_cipher_top.v : 每個component的INOUT資訊(包含每個node)		要
+
+aes_cipher_top.nets : 全部nets連通多少nodes，初始位置要由其他檔案決定	要
