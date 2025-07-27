@@ -6,7 +6,7 @@ from openroad import Tech, Design, Timing
 import re
 import json
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List,Union, Tuple
 # ----------------------------------------------------------------------
 # 1. 先找出「src 目錄」的絕對路徑，再推導 workspace 根目錄
 # ----------------------------------------------------------------------
@@ -27,7 +27,7 @@ RC_TCL       = WORKSPACE / "ICCAD25_PorbC" / "ASAP7" / "setRC.tcl"
 # 2) 讀 LEF ── 先 tech LEF，再 stdcell/其他
 # ----------------------------------------------------------------------
 tech   = ord.Tech()
-
+db = ord.get_db()
 # ----------------------------------------------------------------------
 # 2.1) 先定义用来 parse size/Vt 的 helper，以及临时存储结构
 # ----------------------------------------------------------------------
@@ -167,10 +167,10 @@ for base, fid in cell_name_dict.items():
     full_name_dict[base] = uniq
 
 # 写入 JSON
-Path("full_name_dict.json").write_text(json.dumps(full_name_dict, indent=2))
-# （可选）写 JSON 方便检查
-Path("cell_name_dict.json").write_text(json.dumps(cell_name_dict, indent=2))
-Path("cell_dict.json").write_text(json.dumps(cell_dict,      indent=2))
+# Path("full_name_dict.json").write_text(json.dumps(full_name_dict, indent=2))
+# # （可选）写 JSON 方便检查
+# Path("cell_name_dict.json").write_text(json.dumps(cell_name_dict, indent=2))
+# Path("cell_dict.json").write_text(json.dumps(cell_dict,      indent=2))
 
 tech.readLef(str(TECH_LEF_FILE))
 for lef in sorted(LEF_DIR.glob("*.lef")):
@@ -186,8 +186,6 @@ design.readDef(str(DEF_FILE))
 design.evalTclString(f"read_sdc {SDC_FILE}")
 design.evalTclString(f"source   {RC_TCL}")     # 你沒有 SPEF 時，用 set_rc.tcl
 design.evalTclString(f"estimate_parasitics -placement") 
-design.evalTclString("link_design top")        # ← top module 名字依你的 netlist 而定
-
 
 sta = tech.getSta()
 wns = design.evalTclString("report_wns")
@@ -196,6 +194,7 @@ tns = design.evalTclString("report_tns")
 timing = Timing(design)  
 corner = timing.getCorners()[0]  
 block = design.getBlock()
+db.beginEco(block)
 # # ----------------------------------------------------------------------
 @dataclass
 class CellNode:
@@ -224,7 +223,7 @@ def build_cell_graph(inst,iterms,oterms,block, timing, corner, features,nodes_by
     for iterm in iterms:
         inputnet = iterm.getNet()
         inputnet_outputpins = [it for it in inputnet.getITerms() if it.isOutputSignal()]
-        for pin in outnet_inputpins:
+        for pin in inputnet_outputpins:
             nodes_by_name[name].fanin_cells.append(pin.getInst().getName())
 
     return nodes_by_name
@@ -338,6 +337,35 @@ def update_full_slacks(cellgraph: Dict[str, CellNode],
             slacks.append(min(sr, sf))
         cellgraph[name].features['slack'] = min(slacks) if slacks else 0.0
 
+def get_instance_centers(design) -> Dict[str, Tuple[float,float]]:
+    """
+    返回字典:inst_name -> (x_center, y_center)
+    坐标单位默认是 DBU,如果 to_micron=True 会转换成 μm。
+    """
+    blk = design.getBlock()
+    centers = {}
+    for inst in blk.getInsts():
+        box = inst.getBBox()
+        # 取 BBox 中心
+        x = 0.5 * (box.xMin() + box.xMax())
+        y = 0.5 * (box.yMin() + box.yMax())
+        
+        centers[inst.getName()] = (x, y)
+    return centers
+def compute_displacements(
+    before: Dict[str, Tuple[float,float]],
+    after:  Dict[str, Tuple[float,float]]
+) -> Dict[str, Tuple[float,float]]:
+    """
+    返回 inst_name -> (dx, dy) 的位移字典，只对在 before 和 after 中都出现的 inst 计算。
+    """
+    disp = {}
+    for name, (x0, y0) in before.items():
+        if name in after:
+            x1, y1 = after[name]
+            disp[name] = (x1 - x0, y1 - y0)
+    return disp
+
 # 1. 先讓 STA 準備好等價 cell group
 timing.makeEquivCells()
 master_to_base_map = {}
@@ -346,95 +374,146 @@ for base_name, full_names in full_name_dict.items():
         master_to_base_map[fn] = base_name
 Path("master_to_base_map.json").write_text(json.dumps(master_to_base_map,      indent=2))
 # # ----------------------------------------------------------------------
-# # --------------------------貪婪greeeeeeeeeedy----------------------------------
-# 2. 篩選出所有 slack < 0 的節點，並按 slack 越負越前排序
-neg_nodes = [node for node in cellgraph.values() if node.features['slack'] < 0.0]
-neg_nodes.sort(key=lambda n: n.features['slack'])
-# 3. 對最嚴重的前 N 顆做 sizing（這裡示範 N=50，可視需求調整）
-N = 150
-seed_tns = compute_tns_from_graph(cellgraph)
-print("First TNS =", seed_tns)
+# --------------------------模擬退火 (Simulated Annealing)----------------------------------
+import math
+import random
 
-for epoch in range(8):
-    print(f"\n=== Sizing ROUND {epoch+1}/8 ===")
+# 1. 模擬退火參數設定
+T_initial      = 5.6e-8   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應
+T_final        = 5.0e-10    # 終止溫度
+alpha          = 0.97   # 降溫速率
+steps_per_temp = 50    # 每個溫度下的迭代次數
 
-    # 1) 先刷新所有 node slack
-    update_full_slacks(cellgraph, block, timing, corner)
+# 2. 初始化狀態
+print("\n=== Initializing Simulated Annealing ===")
+update_full_slacks(cellgraph, block, timing, corner)
+current_cost = abs(compute_tns_from_graph(cellgraph))
+best_cost    = current_cost
 
-    # 2) 重新找出负 slack 并排序
+# 儲存目前為止找到的最佳 cell master 指派
+# 這樣我們才能在最後恢復到最佳狀態，而不是 SA 結束時的最後狀態
+best_assignment = {inst.getName(): inst.getMaster() for inst in block.getInsts()}
+
+print("Initial TNS: {-current_cost} ps")
+print("Initial Cost (abs(TNS)): {current_cost}")
+
+temp = T_initial
+iteration = 0
+
+# 3. 模擬退火主迴圈
+while temp > T_final:
+    # 在每個溫度開始時，更新負 slack 節點列表
     neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
     neg_nodes.sort(key=lambda n: n.features['slack'])
-    for i, node in enumerate(neg_nodes[:N]):
-        inst_name = node.name
+    
+    if not neg_nodes:
+        print("All timing violations resolved. Stopping early.")
+        break
+        
+    accepted_moves = 0
+    for i in range(steps_per_temp):
+        # 3.1) 產生一個鄰近狀態 (隨機選擇一個 cell 並 sizing)
+        # 從負 slack 的節點中隨機挑選，讓搜尋更有效率
+        if i % 10 == 0:
+            update_full_slacks(cellgraph, block, timing, corner)  # 建議同步
+            neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
+            neg_nodes.sort(key=lambda n: n.features['slack'])
+        node_to_change = random.choice(neg_nodes)
+        inst_name = node_to_change.name
         inst = block.findInst(inst_name)
+        
         if not inst:
             continue
+
         old_master = inst.getMaster()
+        equiv_cells = timing.equivCells(old_master)
+        equiv_cells_names = [e.getName() for e in equiv_cells]
         old_master_name = old_master.getName()
-        equivCells_masters = timing.equivCells(old_master)
-        equivCells_masters_names = [e.getName() for e in equivCells_masters]
-        # ========================== 使用 timing.equivCells 的邏輯 ==========================
-        idx = equivCells_masters_names.index(old_master_name)
+        idx = equiv_cells_names.index(old_master_name)
 
-        # 3) 构造 upsizing 候选（往后找更大 drive‑strength）
-        cand_masters_names = []
-        for j in (idx+1, idx+3):
-            if j < len(equivCells_masters_names):
-                cand_masters_names.append(equivCells_masters_names[j])
-
-        # 如果没有更强的就跳过
-        if not cand_masters_names:
+        # 如果沒有其他可替換的 cell，就跳過
+        if len(equiv_cells) <= 1:
             continue
-        # ==============================================================================
+        
+        # 隨機挑選一個新的 master
+        new_master = random.choice(equiv_cells)
+        new_master_name = new_master.getName()
+        # 確保新舊 master 不同
+        while new_master.getName() == old_master.getName():
+            new_master = random.choice(equiv_cells)
+        while equiv_cells_names.index(new_master_name) < equiv_cells_names.index(old_master_name) :
+            new_master = random.choice(equiv_cells)
+        # 3.2) 計算成本變化 (ΔE)
+        # 在交換前，TNS 就是目前的 current_cost
+        
+        # 執行交換
+        inst.swapMaster(new_master)
+        update_full_slacks(cellgraph, block, timing, corner)
+        new_cost = abs(compute_tns_from_graph(cellgraph))
+        design.evalTclString("report_tns")
+        delta_E = new_cost - current_cost
 
-        best_tns_so_far = seed_tns
-        best_master_name_to_swap = None
-
-        for new_master_name in cand_masters_names:
-            # 需要從 cell name (string) 找到 master object
-            for equivCells_master in equivCells_masters:
-                if new_master_name == equivCells_master.getName():
-                    new_master = equivCells_master
-    
-            # 暫時應用 Sizing
-            inst.swapMaster(new_master)
-            update_full_slacks(cellgraph,block,timing,corner)
-            design.evalTclString("report_tns")
-            # new_tns = float(design.evalTclString("report_tns").split()[0])
-            new_tns = compute_tns_from_graph(cellgraph)
-
-            if new_tns > best_tns_so_far:
-                best_tns_so_far = new_tns
-                best_master_name_to_swap = new_master_name
-                best_master_to_swap = new_master
-
-            # 復原狀態
+        # 3.3) 根據 Metropolis 準則決定是否接受新狀態
+        # 如果是更優的解 (delta_E < 0)，或者以一定機率接受較差的解
+        if delta_E < 0 or (temp > 0 and random.random() < math.exp(-delta_E / temp)):
+            # 接受新狀態
+            current_cost = new_cost
+            accepted_moves += 1
+            # 如果這個新狀態是至今為止最好的，就記錄下來
+            if current_cost < best_cost:
+                best_cost = current_cost
+                best_assignment = {i.getName(): i.getMaster() for i in block.getInsts()}
+                print(f"  ---> New best found! TNS: {-best_cost} ps")
+                design.evalTclString("report_tns")
+        else:
+            # 不接受，恢復原狀
             inst.swapMaster(old_master)
 
-        # 做出最終決定
-        if best_master_name_to_swap:
-            improvement = best_tns_so_far - seed_tns
-            
-            # 永久應用最佳的 Sizing
-            best_master = best_master_to_swap
-            inst.swapMaster(best_master)
-            update_full_slacks(cellgraph,block,timing,corner)
-            
-            print(f"[{i+1}/{N}] Sizing {inst_name}: {old_master_name} -> {best_master_name_to_swap}, New TNS: {best_tns_so_far:.4f}, ΔTNS: +{improvement:.4f}")
-
-            # 更新下一次迭代的基準 TNS
-            seed_tns = best_tns_so_far
-            
-        else:
-            print(f"[{i+1}/{N}] Sizing {inst_name}: No improvement found.")
-    N -= 20    
-
+    # 顯示目前進度
+    print(f"Temp: {temp} | Current TNS: {-current_cost} | Best TNS: {-best_cost} | Accepted: {accepted_moves}/{steps_per_temp}")
     
-# # ----------------------------------------------------------------------
+    # 3.4) 降溫
+    temp *= alpha
+    iteration += 1
+
+# 4. 恢復到找到的最佳狀態
+print("\n=== Simulated Annealing Finished. Restoring best found state... ===")
+for inst_name, best_master in best_assignment.items():
+    inst = block.findInst(inst_name)
+    if inst:
+        inst.swapMaster(best_master)
+
+# # --------------------------貪婪greeeeeeeeeedy結束----------------------------------
+# # --------------------------report---------------------------------- 
+update_full_slacks(cellgraph, block, timing, corner)
+print("Final TNS =", compute_tns_from_graph(cellgraph))
+design.evalTclString("report_tns")
+design.evalTclString("report_wns")  
+# # ---------------------------buffer-------------------------------------
+# design.evalTclString("estimate_parasitics -placement")
+# design.evalTclString("repair_design -match_cell_footprint  -max_wire_length 10 ") 
+# # ---------------------------buffer-------------------------------------    
+# # ----------------------------detailed placement-------------------------------------
+before_centers = get_instance_centers(design)
+site = design.getBlock().getRows()[0].getSite()
+max_disp_x = int(design.micronToDBU(4) / site.getWidth())
+max_disp_y = int(design.micronToDBU(4) / site.getHeight())
+design.getOpendp().detailedPlacement(max_disp_x, max_disp_y, "dpl_failures.txt",)
+after_centers = get_instance_centers(design)
+displacements = compute_displacements(before_centers, after_centers)
+# # ----------------------------detailed placement-------------------------------------
+# # ---------------------------------final report-------------------------------------
 # 最後一次 full STA／報告
 update_full_slacks(cellgraph, block, timing, corner)
 print("Final TNS =", compute_tns_from_graph(cellgraph))
 design.evalTclString("report_tns")
 design.evalTclString("report_wns")
+total_abs_dx = sum(abs(dx) for dx, dy in displacements.values())
+total_abs_dy = sum(abs(dy) for dx, dy in displacements.values())
+print(f"Total |Δx| = {total_abs_dx} μm, Total |Δy| = {total_abs_dy} μm")
 design.evalTclString("report_power")
-# # ----------------------------------------------------------------------
+# # ---------------------------------final report-------------------------------------
+# # -----------------------------write def-----------------------------------------
+db.endEco(block)
+design.writeDef("final.def")
+# design.getDb().writeEco(block,"eco_changelist.eco")
