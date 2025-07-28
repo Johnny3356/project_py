@@ -320,12 +320,15 @@ print(worstpinslack)
 def compute_tns_from_graph(cellgraph):
     return sum(node.features['tns']
                for node in cellgraph.values() )
+def compute_fake_tns_from_graph(cellgraph):
+    return sum(node.features['slack']
+               for node in cellgraph.values() if node.features['slack'] < 0.0 )
 def compute_power(block,timing,corner):
     static_p = sum(timing.staticPower(block.findInst(n), corner)
                for n in cellgraph)
     dyn_p    = sum(timing.dynamicPower(block.findInst(n), corner)
                for n in cellgraph)
-    return static_p + dyn_p  # 單位：瓦    
+    return static_p + dyn_p      
 def update_full_slacks(cellgraph: Dict[str, CellNode],
                   block, timing, corner) -> None:
     for inst in block.getInsts():
@@ -438,7 +441,7 @@ for epoch in range(8):
 
         # 3) 构造 upsizing 候选（往后找更大 drive‑strength）
         cand_masters_names = []
-        for j in (idx-1,idx+3,idx+6):
+        for j in (idx-1,idx+2,idx+6):
             if 0 <= j < len(equivCells_masters_names) :
                 cand_masters_names.append(equivCells_masters_names[j])
 
