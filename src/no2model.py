@@ -379,10 +379,10 @@ import math
 import random
 
 # 1. 模擬退火參數設定
-T_initial      = 5.6e-8   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應
-T_final        = 5.0e-10    # 終止溫度
+T_initial      = 1e-10   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應
 alpha          = 0.97   # 降溫速率
-steps_per_temp = 50    # 每個溫度下的迭代次數
+steps_per_temp = 10    # 每個溫度下的迭代次數
+iterations     = 1000  # 總迭代次數
 
 # 2. 初始化狀態
 print("\n=== Initializing Simulated Annealing ===")
@@ -394,14 +394,14 @@ best_cost    = current_cost
 # 這樣我們才能在最後恢復到最佳狀態，而不是 SA 結束時的最後狀態
 best_assignment = {inst.getName(): inst.getMaster() for inst in block.getInsts()}
 
-print("Initial TNS: {-current_cost} ps")
-print("Initial Cost (abs(TNS)): {current_cost}")
+print(f"Initial TNS: {-current_cost} ps")
+print(f"Initial Cost (abs(TNS)): {current_cost}")
 
 temp = T_initial
 iteration = 0
 
 # 3. 模擬退火主迴圈
-while temp > T_final:
+while iteration < iterations:
     # 在每個溫度開始時，更新負 slack 節點列表
     neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
     neg_nodes.sort(key=lambda n: n.features['slack'])
@@ -441,8 +441,8 @@ while temp > T_final:
         # 確保新舊 master 不同
         while new_master.getName() == old_master.getName():
             new_master = random.choice(equiv_cells)
-        while equiv_cells_names.index(new_master_name) < equiv_cells_names.index(old_master_name) :
-            new_master = random.choice(equiv_cells)
+        # while equiv_cells_names.index(new_master_name) < equiv_cells_names.index(old_master_name) :
+        #     new_master = random.choice(equiv_cells)
         # 3.2) 計算成本變化 (ΔE)
         # 在交換前，TNS 就是目前的 current_cost
         
@@ -450,28 +450,31 @@ while temp > T_final:
         inst.swapMaster(new_master)
         update_full_slacks(cellgraph, block, timing, corner)
         new_cost = abs(compute_tns_from_graph(cellgraph))
-        design.evalTclString("report_tns")
+        # design.evalTclString("report_tns")
         delta_E = new_cost - current_cost
 
         # 3.3) 根據 Metropolis 準則決定是否接受新狀態
         # 如果是更優的解 (delta_E < 0)，或者以一定機率接受較差的解
         if delta_E < 0 or (temp > 0 and random.random() < math.exp(-delta_E / temp)):
             # 接受新狀態
+            print('delta',delta_E)
+            print('temp',temp)
             current_cost = new_cost
             accepted_moves += 1
             # 如果這個新狀態是至今為止最好的，就記錄下來
             if current_cost < best_cost:
                 best_cost = current_cost
-                best_assignment = {i.getName(): i.getMaster() for i in block.getInsts()}
-                print(f"  ---> New best found! TNS: {-best_cost} ps")
+                if iteration > iterations - 10 and iteration < iterations:
+                    best_assignment = {i.getName(): i.getMaster() for i in block.getInsts()}
+                print(f"  ---> New best found! TNS: {-best_cost} s")
                 design.evalTclString("report_tns")
         else:
             # 不接受，恢復原狀
             inst.swapMaster(old_master)
 
     # 顯示目前進度
-    print(f"Temp: {temp} | Current TNS: {-current_cost} | Best TNS: {-best_cost} | Accepted: {accepted_moves}/{steps_per_temp}")
-    
+    print(f"Temp: {temp} | Current TNS: {-current_cost} s | Best TNS: {-best_cost} s | Accepted: {accepted_moves}/{steps_per_temp}")
+
     # 3.4) 降溫
     temp *= alpha
     iteration += 1
