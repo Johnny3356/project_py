@@ -241,18 +241,31 @@ for inst in block.getInsts():
     output_terms = [it for it in inst.getITerms() if it.isOutputSignal()]
 
     # 1) slack：所有输入 pin 的 min(slack_rise, slack_fall) 中的最小值
+    total_n_slack = 0.0
     slacks = []
+    endpoints = []
     for it in input_terms:
         # 跳过非 signal（VDD/VSS）
         if it.getNet().getSigType() != "SIGNAL":
             continue
+        if timing.isEndpoint(it):
+            endpoints.append(it)
         sr = timing.getPinSlack(it, timing.Rise, timing.Max)
         sf = timing.getPinSlack(it, timing.Fall, timing.Max)
-        slacks.append(min(sr, sf))
+        pin_slack = min(sr, sf)
+        slacks.append(pin_slack)
+
     slack = min(slacks) if slacks else 0.0
     if slack < worstpinslack:
             worstpinslack = slack
-
+    
+    # 1.1) tns
+    for pin in endpoints:
+        slack_r = timing.getPinSlack(pin, timing.Rise, timing.Max)
+        slack_f = timing.getPinSlack(pin, timing.Fall, timing.Max)
+        worst_slack = min(slack_r, slack_f)
+        if worst_slack < 0:
+            total_n_slack += worst_slack
     # 2) in_slew
     in_slews = [timing.getPinSlew(it) for it in input_terms]
     in_slew  = max(in_slews) if in_slews else 0.0
@@ -290,6 +303,7 @@ for inst in block.getInsts():
 
     features[name] = {
         'slack':       slack,
+        'tns':       total_n_slack,
         'in_slew':     in_slew,
         'out_slew':    out_slew,
         'arc_delay':   arc_delay,
@@ -304,29 +318,14 @@ for inst in block.getInsts():
 print(worstpinslack)
 # # ----------------------------------------------------------------------
 def compute_tns_from_graph(cellgraph):
-    return sum(node.features['slack']
-               for node in cellgraph.values()
-               if node.features['slack'] < 0.0)
+    return sum(node.features['tns']
+               for node in cellgraph.values() )
 def compute_power(block,timing,corner):
     static_p = sum(timing.staticPower(block.findInst(n), corner)
                for n in cellgraph)
     dyn_p    = sum(timing.dynamicPower(block.findInst(n), corner)
                for n in cellgraph)
     return static_p + dyn_p  # 單位：瓦    
-    
-# def compute_tns_from_sub_graph(cellnode,block,cell_dict,cell_name_dict,cellgraph):
-#     allslack = cellnode.features['slack']
-#     update_full_slacks(cellgraph,block,timing,corner)
-#     for fanout_cell_name in fanout_cells:
-#         inst =  cellgraph[fanout_cell_name]
-#         # new_slack = update_cell_slack(block,inst.name,cell_dict,cell_name_dict)
-#         allslack += inst.features['slack']
-#     for fanin_cell_name in fanin_cells:
-#         inst =  block.findInst(fanin_cell_name)
-#         # new_slack = update_cell_slack(block,cellnode.name,cell_dict,cell_name_dict)
-#         allslack += inst.features['slack']
-#     return allslack
-
 def update_full_slacks(cellgraph: Dict[str, CellNode],
                   block, timing, corner) -> None:
     for inst in block.getInsts():
@@ -337,12 +336,22 @@ def update_full_slacks(cellgraph: Dict[str, CellNode],
             if it.isInputSignal() and it.getNet().getSigType()=="SIGNAL"
         ]
         slacks = []
+        endpoints = []
+        total_n_slack = 0.0
         for it in input_terms:
+            if timing.isEndpoint(it):
+                endpoints.append(it)
             sr = timing.getPinSlack(it, timing.Rise, timing.Max)
             sf = timing.getPinSlack(it, timing.Fall, timing.Max)
             slacks.append(min(sr, sf))
+        for pin in endpoints:
+            slack_r = timing.getPinSlack(pin, timing.Rise, timing.Max)
+            slack_f = timing.getPinSlack(pin, timing.Fall, timing.Max)
+            worst_slack = min(slack_r, slack_f)
+            if worst_slack < 0:
+                total_n_slack += worst_slack
         cellgraph[name].features['slack'] = min(slacks) if slacks else 0.0
-
+        cellgraph[name].features['tns'] = total_n_slack
 def get_instance_centers(design) -> Dict[str, Tuple[float,float]]:
     """
     返回字典:inst_name -> (x_center, y_center)
@@ -380,9 +389,11 @@ for base_name, full_names in full_name_dict.items():
         master_to_base_map[fn] = base_name
 Path("master_to_base_map.json").write_text(json.dumps(master_to_base_map,      indent=2))
 # # ----------------------------------------------------------------------
+seed_tns = compute_tns_from_graph(cellgraph)
+print("First TNS =", seed_tns)
 # # --------------------------貪婪greeeeeeeeeedy----------------------------------
 # 2. 篩選出所有 slack < 0 的節點，並按 slack 越負越前排序
-N = 15
+N = 150
 neg_nodes = [node for node in cellgraph.values() if node.features['slack'] < 0.0]
 neg_nodes.sort(key=lambda n: n.features['slack'])
 for i, node in enumerate(neg_nodes[:N]):
@@ -479,7 +490,7 @@ for epoch in range(8):
             print(f"[{i+1}/{N}] Sizing {inst_name}: No improvement found.")
             b += 1
             
-    N -= 2
+    N -= 20
     print(a,b)
 # # --------------------------貪婪greeeeeeeeeedy結束----------------------------------
 # # --------------------------report---------------------------------- 
@@ -488,6 +499,8 @@ print("Final TNS =", compute_tns_from_graph(cellgraph))
 design.evalTclString("report_tns")
 design.evalTclString("report_wns")  
 # # --------------------------moveeeeeeeeee---------------------------------- 
+design.evalTclString("improve_placement") 
+design.evalTclString("report_tns")
 # neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
 # neg_nodes.sort(key=lambda n: n.features['slack'])
 # for i, node in enumerate(neg_nodes[:N]):
@@ -502,21 +515,22 @@ design.evalTclString("report_wns")
 #     x_in_lists = []
 #     y_in_lists = []
 #     for in_node in node.fanin_cells:
-#         in_node_inst_name = in_node.name
-#         in_node_inst = block.findInst(in_node_inst_name)
-#         box = inst.getBBox()
+#         in_node_inst = block.findInst(in_node)
+#         in_node_inst_name = in_node_inst.getName()
+#         box = in_node_inst.getBBox()
 #         in_node_inst_x = 0.5 * (box.xMin() + box.xMax())
 #         in_node_inst_y = 0.5 * (box.yMin() + box.yMax())
 #         x_in_lists.append(in_node_inst_x)
 #         y_in_lists.append(in_node_inst_y)
-#     ava_xin = sum(x_in_inst for x_in_inst in x_in_insts)/len(x_in_insts)
-#     ava_yin = sum(y_in_inst for y_in_inst in y_in_insts)/len(y_in_insts)
-#     delta_x = inst_x - ava_xin  
-#     delta_y = inst_y - ava_yin  
-#     box.xMin() -= delta_x/10
-#     box.xMax() -= delta_x/10
-#     box.yMin() -= delta_y/10
-#     box.yMax() -= delta_y/10
+#         ava_xin = sum(x_in_inst for x_in_inst in x_in_lists)/len(x_in_lists)
+#         ava_yin = sum(y_in_inst for y_in_inst in y_in_lists)/len(y_in_lists)
+#         delta_x = inst_x - ava_xin  
+#         delta_y = inst_y - ava_yin  
+#         new_x_min = box.xMin() - delta_x/10
+#         new_x_max = box.xMax() - delta_x/10
+#         new_y_min = box.yMin() - delta_y/10
+#         new_y_max = box.yMax() - delta_y/10
+#         in_node_inst.setBBox(new_x_min, new_y_min, new_x_max, new_y_max)
 # # ---------------------------moveeeeeeee-------------------------------------
 # # ---------------------------buffer-------------------------------------
 # design.evalTclString("estimate_parasitics -placement")
