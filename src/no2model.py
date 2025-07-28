@@ -241,18 +241,31 @@ for inst in block.getInsts():
     output_terms = [it for it in inst.getITerms() if it.isOutputSignal()]
 
     # 1) slack：所有输入 pin 的 min(slack_rise, slack_fall) 中的最小值
+    total_n_slack = 0.0
     slacks = []
+    endpoints = []
     for it in input_terms:
         # 跳过非 signal（VDD/VSS）
         if it.getNet().getSigType() != "SIGNAL":
             continue
+        if timing.isEndpoint(it):
+            endpoints.append(it)
         sr = timing.getPinSlack(it, timing.Rise, timing.Max)
         sf = timing.getPinSlack(it, timing.Fall, timing.Max)
-        slacks.append(min(sr, sf))
+        pin_slack = min(sr, sf)
+        slacks.append(pin_slack)
+
     slack = min(slacks) if slacks else 0.0
     if slack < worstpinslack:
             worstpinslack = slack
-
+    
+    # 1.1) tns
+    for pin in endpoints:
+        slack_r = timing.getPinSlack(pin, timing.Rise, timing.Max)
+        slack_f = timing.getPinSlack(pin, timing.Fall, timing.Max)
+        worst_slack = min(slack_r, slack_f)
+        if worst_slack < 0:
+            total_n_slack += worst_slack
     # 2) in_slew
     in_slews = [timing.getPinSlew(it) for it in input_terms]
     in_slew  = max(in_slews) if in_slews else 0.0
@@ -290,6 +303,7 @@ for inst in block.getInsts():
 
     features[name] = {
         'slack':       slack,
+        'tns':       total_n_slack,
         'in_slew':     in_slew,
         'out_slew':    out_slew,
         'arc_delay':   arc_delay,
@@ -304,23 +318,17 @@ for inst in block.getInsts():
 print(worstpinslack)
 # # ----------------------------------------------------------------------
 def compute_tns_from_graph(cellgraph):
+    return sum(node.features['tns']
+               for node in cellgraph.values() )
+def compute_fake_tns_from_graph(cellgraph):
     return sum(node.features['slack']
-               for node in cellgraph.values()
-               if node.features['slack'] < 0.0)
-    
-# def compute_tns_from_sub_graph(cellnode,block,cell_dict,cell_name_dict,cellgraph):
-#     allslack = cellnode.features['slack']
-#     update_full_slacks(cellgraph,block,timing,corner)
-#     for fanout_cell_name in fanout_cells:
-#         inst =  cellgraph[fanout_cell_name]
-#         # new_slack = update_cell_slack(block,inst.name,cell_dict,cell_name_dict)
-#         allslack += inst.features['slack']
-#     for fanin_cell_name in fanin_cells:
-#         inst =  block.findInst(fanin_cell_name)
-#         # new_slack = update_cell_slack(block,cellnode.name,cell_dict,cell_name_dict)
-#         allslack += inst.features['slack']
-#     return allslack
-
+               for node in cellgraph.values() if node.features['slack'] < 0.0 )
+def compute_power(block,timing,corner):
+    static_p = sum(timing.staticPower(block.findInst(n), corner)
+               for n in cellgraph)
+    dyn_p    = sum(timing.dynamicPower(block.findInst(n), corner)
+               for n in cellgraph)
+    return static_p + dyn_p      
 def update_full_slacks(cellgraph: Dict[str, CellNode],
                   block, timing, corner) -> None:
     for inst in block.getInsts():
@@ -331,11 +339,22 @@ def update_full_slacks(cellgraph: Dict[str, CellNode],
             if it.isInputSignal() and it.getNet().getSigType()=="SIGNAL"
         ]
         slacks = []
+        endpoints = []
+        total_n_slack = 0.0
         for it in input_terms:
+            if timing.isEndpoint(it):
+                endpoints.append(it)
             sr = timing.getPinSlack(it, timing.Rise, timing.Max)
             sf = timing.getPinSlack(it, timing.Fall, timing.Max)
             slacks.append(min(sr, sf))
+        for pin in endpoints:
+            slack_r = timing.getPinSlack(pin, timing.Rise, timing.Max)
+            slack_f = timing.getPinSlack(pin, timing.Fall, timing.Max)
+            worst_slack = min(slack_r, slack_f)
+            if worst_slack < 0:
+                total_n_slack += worst_slack
         cellgraph[name].features['slack'] = min(slacks) if slacks else 0.0
+        cellgraph[name].features['tns'] = total_n_slack
 
 def get_instance_centers(design) -> Dict[str, Tuple[float,float]]:
     """
