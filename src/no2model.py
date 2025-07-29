@@ -7,22 +7,37 @@ import re
 import json
 from dataclasses import dataclass, field
 from typing import Dict, List,Union, Tuple
+import sys
+import argparse
 # ----------------------------------------------------------------------
 # 1. 先找出「src 目錄」的絕對路徑，再推導 workspace 根目錄
 # ----------------------------------------------------------------------
-THIS_PY   = Path(__file__).resolve()          # /mnt/c/.../iccad_c/src/run_rl.py
-SRC_DIR   = THIS_PY.parent                    # /mnt/c/.../iccad_c/src
-WORKSPACE = SRC_DIR.parent                    # /mnt/c/.../iccad_c
+
+parser = argparse.ArgumentParser(description="Run design optimization")
+parser.add_argument('--design', type=str, required=True, help='Design name')
+parser.add_argument('--wl', type=float, required=True, help='Wirelength weight')
+parser.add_argument('--power', type=float, required=True, help='Power weight')
+parser.add_argument('--timing', type=float, required=True, help='Timing weight')
+args = parser.parse_args()
+
+WL_WEIGHT     = args.wl
+POWER_WEIGHT  = args.power
+TIMING_WEIGHT = args.timing
+
+THIS_PY   = Path(__file__).resolve()                   # /mnt/c/.../project_py/src/no2model.py
+SRC_DIR   = THIS_PY.parent                             # /mnt/c/.../project_py/src
+WORKSPACE = SRC_DIR.parent                             # /mnt/c/.../project_py
+DESIGN_PATH = WORKSPACE / Path(args.design)            # /mnt/c/.../project_py/ICCAD25_PorbC
 
 # 1.1. 組出 testcase、lib、lef、def 的完整路徑
-TESTCASE_DIR = WORKSPACE / "ICCAD25_PorbC" / "ASAP7"
+TESTCASE_DIR = DESIGN_PATH / "ASAP7"
 LIB_DIR      = TESTCASE_DIR / "LIB"
 LEF_DIR      = TESTCASE_DIR / "LEF" 
 TECH_LEF_DIR      = TESTCASE_DIR / "techlef" 
 TECH_LEF_FILE = TECH_LEF_DIR / "asap7_tech_1x_201209.lef"
-DEF_FILE     = WORKSPACE / "ICCAD25_PorbC" / "aes_cipher_top" / "aes_cipher_top.def"
-SDC_FILE     = WORKSPACE / "ICCAD25_PorbC" / "aes_cipher_top" / "aes_cipher_top.sdc"
-RC_TCL       = WORKSPACE / "ICCAD25_PorbC" / "ASAP7" / "setRC.tcl"
+DEF_FILE     = DESIGN_PATH / "aes_cipher_top" / "aes_cipher_top.def"
+SDC_FILE     = DESIGN_PATH / "aes_cipher_top" / "aes_cipher_top.sdc"
+RC_TCL       = TESTCASE_DIR / "setRC.tcl"
 # ----------------------------------------------------------------------
 # 2) 讀 LEF ── 先 tech LEF，再 stdcell/其他
 # ----------------------------------------------------------------------
@@ -241,18 +256,31 @@ for inst in block.getInsts():
     output_terms = [it for it in inst.getITerms() if it.isOutputSignal()]
 
     # 1) slack：所有输入 pin 的 min(slack_rise, slack_fall) 中的最小值
+    total_n_slack = 0.0
     slacks = []
+    endpoints = []
     for it in input_terms:
         # 跳过非 signal（VDD/VSS）
         if it.getNet().getSigType() != "SIGNAL":
             continue
+        if timing.isEndpoint(it):
+            endpoints.append(it)
         sr = timing.getPinSlack(it, timing.Rise, timing.Max)
         sf = timing.getPinSlack(it, timing.Fall, timing.Max)
-        slacks.append(min(sr, sf))
+        pin_slack = min(sr, sf)
+        slacks.append(pin_slack)
+
     slack = min(slacks) if slacks else 0.0
     if slack < worstpinslack:
             worstpinslack = slack
-
+    
+    # 1.1) tns
+    for pin in endpoints:
+        slack_r = timing.getPinSlack(pin, timing.Rise, timing.Max)
+        slack_f = timing.getPinSlack(pin, timing.Fall, timing.Max)
+        worst_slack = min(slack_r, slack_f)
+        if worst_slack < 0:
+            total_n_slack += worst_slack
     # 2) in_slew
     in_slews = [timing.getPinSlew(it) for it in input_terms]
     in_slew  = max(in_slews) if in_slews else 0.0
@@ -290,6 +318,7 @@ for inst in block.getInsts():
 
     features[name] = {
         'slack':       slack,
+        'tns':       total_n_slack,
         'in_slew':     in_slew,
         'out_slew':    out_slew,
         'arc_delay':   arc_delay,
@@ -304,23 +333,17 @@ for inst in block.getInsts():
 print(worstpinslack)
 # # ----------------------------------------------------------------------
 def compute_tns_from_graph(cellgraph):
+    return sum(node.features['tns']
+               for node in cellgraph.values() )
+def compute_fake_tns_from_graph(cellgraph):
     return sum(node.features['slack']
-               for node in cellgraph.values()
-               if node.features['slack'] < 0.0)
-    
-# def compute_tns_from_sub_graph(cellnode,block,cell_dict,cell_name_dict,cellgraph):
-#     allslack = cellnode.features['slack']
-#     update_full_slacks(cellgraph,block,timing,corner)
-#     for fanout_cell_name in fanout_cells:
-#         inst =  cellgraph[fanout_cell_name]
-#         # new_slack = update_cell_slack(block,inst.name,cell_dict,cell_name_dict)
-#         allslack += inst.features['slack']
-#     for fanin_cell_name in fanin_cells:
-#         inst =  block.findInst(fanin_cell_name)
-#         # new_slack = update_cell_slack(block,cellnode.name,cell_dict,cell_name_dict)
-#         allslack += inst.features['slack']
-#     return allslack
-
+               for node in cellgraph.values() if node.features['slack'] < 0.0 )
+def compute_power(block,timing,corner):
+    static_p = sum(timing.staticPower(block.findInst(n), corner)
+               for n in cellgraph)
+    dyn_p    = sum(timing.dynamicPower(block.findInst(n), corner)
+               for n in cellgraph)
+    return static_p + dyn_p      
 def update_full_slacks(cellgraph: Dict[str, CellNode],
                   block, timing, corner) -> None:
     for inst in block.getInsts():
@@ -331,11 +354,22 @@ def update_full_slacks(cellgraph: Dict[str, CellNode],
             if it.isInputSignal() and it.getNet().getSigType()=="SIGNAL"
         ]
         slacks = []
+        endpoints = []
+        total_n_slack = 0.0
         for it in input_terms:
+            if timing.isEndpoint(it):
+                endpoints.append(it)
             sr = timing.getPinSlack(it, timing.Rise, timing.Max)
             sf = timing.getPinSlack(it, timing.Fall, timing.Max)
             slacks.append(min(sr, sf))
+        for pin in endpoints:
+            slack_r = timing.getPinSlack(pin, timing.Rise, timing.Max)
+            slack_f = timing.getPinSlack(pin, timing.Fall, timing.Max)
+            worst_slack = min(slack_r, slack_f)
+            if worst_slack < 0:
+                total_n_slack += worst_slack
         cellgraph[name].features['slack'] = min(slacks) if slacks else 0.0
+        cellgraph[name].features['tns'] = total_n_slack
 
 def get_instance_centers(design) -> Dict[str, Tuple[float,float]]:
     """
