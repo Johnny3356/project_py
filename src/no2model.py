@@ -7,22 +7,37 @@ import re
 import json
 from dataclasses import dataclass, field
 from typing import Dict, List,Union, Tuple
+import sys
+import argparse
 # ----------------------------------------------------------------------
 # 1. 先找出「src 目錄」的絕對路徑，再推導 workspace 根目錄
 # ----------------------------------------------------------------------
-THIS_PY   = Path(__file__).resolve()          # /mnt/c/.../iccad_c/src/run_rl.py
-SRC_DIR   = THIS_PY.parent                    # /mnt/c/.../iccad_c/src
-WORKSPACE = SRC_DIR.parent                    # /mnt/c/.../iccad_c
+
+parser = argparse.ArgumentParser(description="Run design optimization")
+parser.add_argument('--design', type=str, required=True, help='Design name')
+parser.add_argument('--wl', type=float, required=True, help='Wirelength weight')
+parser.add_argument('--power', type=float, required=True, help='Power weight')
+parser.add_argument('--timing', type=float, required=True, help='Timing weight')
+args = parser.parse_args()
+
+WL_WEIGHT     = args.wl
+POWER_WEIGHT  = args.power
+TIMING_WEIGHT = args.timing
+
+THIS_PY   = Path(__file__).resolve()                   # /mnt/c/.../project_py/src/no2model.py
+SRC_DIR   = THIS_PY.parent                             # /mnt/c/.../project_py/src
+WORKSPACE = SRC_DIR.parent                             # /mnt/c/.../project_py
+DESIGN_PATH = WORKSPACE / Path(args.design)            # /mnt/c/.../project_py/ICCAD25_PorbC
 
 # 1.1. 組出 testcase、lib、lef、def 的完整路徑
-TESTCASE_DIR = WORKSPACE / "ICCAD25_PorbC" / "ASAP7"
+TESTCASE_DIR = DESIGN_PATH / "ASAP7"
 LIB_DIR      = TESTCASE_DIR / "LIB"
 LEF_DIR      = TESTCASE_DIR / "LEF" 
 TECH_LEF_DIR      = TESTCASE_DIR / "techlef" 
 TECH_LEF_FILE = TECH_LEF_DIR / "asap7_tech_1x_201209.lef"
-DEF_FILE     = WORKSPACE / "ICCAD25_PorbC" / "aes_cipher_top" / "aes_cipher_top.def"
-SDC_FILE     = WORKSPACE / "ICCAD25_PorbC" / "aes_cipher_top" / "aes_cipher_top.sdc"
-RC_TCL       = WORKSPACE / "ICCAD25_PorbC" / "ASAP7" / "setRC.tcl"
+DEF_FILE     = DESIGN_PATH / "aes_cipher_top" / "aes_cipher_top.def"
+SDC_FILE     = DESIGN_PATH / "aes_cipher_top" / "aes_cipher_top.sdc"
+RC_TCL       = TESTCASE_DIR / "setRC.tcl"
 # ----------------------------------------------------------------------
 # 2) 讀 LEF ── 先 tech LEF，再 stdcell/其他
 # ----------------------------------------------------------------------
