@@ -416,12 +416,16 @@ Path("master_to_base_map.json").write_text(json.dumps(master_to_base_map,      i
 # --------------------------模擬退火 (Simulated Annealing)----------------------------------
 import math
 import random
+# 設定隨機種子，確保每次執行結果一致
+SEED = random.randint(0, 2**31 - 1)
+random.seed(544423709)
+print(f"Random seed: {SEED}")
 
 # 1. 模擬退火參數設定
 T_initial      = 1e-10   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應   # 標準化
 alpha          = 0.98   # 降溫速率
 steps_per_temp = 10    # 每個溫度下的迭代次數
-iterations     = 200  # 總迭代次數
+iterations     = 10  # 總迭代次數
 
 # 2. 初始化狀態
 print("\n=== Initializing Simulated Annealing ===")
@@ -551,6 +555,7 @@ displacements = compute_displacements(before_centers, after_centers)
 # 最後一次 full STA／報告
 update_full_slacks(cellgraph, block, timing, corner)
 print("Final TNS =", compute_tns_from_graph(cellgraph))
+print("seed:", SEED)
 design.evalTclString("report_tns")
 design.evalTclString("report_wns")
 total_abs_dx = sum(abs(dx) for dx, dy in displacements.values())
