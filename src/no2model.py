@@ -1,3 +1,6 @@
+#標準化
+#算法退火結構
+#power要加到cost function
 from pathlib import Path
 import openroad as ord
 import os
@@ -9,9 +12,11 @@ from dataclasses import dataclass, field
 from typing import Dict, List,Union, Tuple
 import sys
 import argparse
+import time
 # ----------------------------------------------------------------------
 # 1. 先找出「src 目錄」的絕對路徑，再推導 workspace 根目錄
 # ----------------------------------------------------------------------
+start_time = time.time()
 
 parser = argparse.ArgumentParser(description="Run design optimization")
 parser.add_argument('--design', type=str, required=True, help='Design name')
@@ -413,10 +418,10 @@ import math
 import random
 
 # 1. 模擬退火參數設定
-T_initial      = 1e-10   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應
-alpha          = 0.97   # 降溫速率
+T_initial      = 1e-10   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應   # 標準化
+alpha          = 0.98   # 降溫速率
 steps_per_temp = 10    # 每個溫度下的迭代次數
-iterations     = 1000  # 總迭代次數
+iterations     = 200  # 總迭代次數
 
 # 2. 初始化狀態
 print("\n=== Initializing Simulated Annealing ===")
@@ -436,6 +441,9 @@ iteration = 0
 
 # 3. 模擬退火主迴圈
 while iteration < iterations:
+    # 每次迭代開始時，顯示目前溫度和迭代次數
+    print(f"\n=== Iteration {iteration + 1} / {iterations} ===")
+
     # 在每個溫度開始時，更新負 slack 節點列表
     neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
     neg_nodes.sort(key=lambda n: n.features['slack'])
@@ -499,7 +507,7 @@ while iteration < iterations:
             if current_cost < best_cost:
                 best_cost = current_cost
                 if iteration > iterations - 10 and iteration < iterations:
-                    best_assignment = {i.getName(): i.getMaster() for i in block.getInsts()}
+                    best_assignment = {i.getName(): i.getMaster() for i in block.getInsts()}#可改
                 print(f"  ---> New best found! TNS: {-best_cost} s")
                 design.evalTclString("report_tns")
         else:
@@ -533,8 +541,8 @@ design.evalTclString("report_wns")
 # # ----------------------------detailed placement-------------------------------------
 before_centers = get_instance_centers(design)
 site = design.getBlock().getRows()[0].getSite()
-max_disp_x = int(design.micronToDBU(4) / site.getWidth())
-max_disp_y = int(design.micronToDBU(4) / site.getHeight())
+max_disp_x = int(design.micronToDBU(6) / site.getWidth())
+max_disp_y = int(design.micronToDBU(6) / site.getHeight())
 design.getOpendp().detailedPlacement(max_disp_x, max_disp_y, "dpl_failures.txt",)
 after_centers = get_instance_centers(design)
 displacements = compute_displacements(before_centers, after_centers)
@@ -553,4 +561,7 @@ design.evalTclString("report_power")
 # # -----------------------------write def-----------------------------------------
 db.endEco(block)
 design.writeDef("final.def")
+ending_time = time.time()
+elapsed_time = ending_time - start_time
+print(f"Total elapsed time: {elapsed_time:.2f} seconds")
 # design.getDb().writeEco(block,"eco_changelist.eco")
