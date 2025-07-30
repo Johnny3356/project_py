@@ -1,5 +1,4 @@
 #標準化
-#算法退火結構
 #power要加到cost function
 from pathlib import Path
 import openroad as ord
@@ -219,7 +218,6 @@ db.beginEco(block)
 @dataclass
 class CellNode:
     name: str                             # instance 名稱
-    old_name: str
     master: str                           # 使用的 library cell 名稱
     features: Dict[str, float]            # 你前面算好的特徵字典
     fanout_cells: List[str] = field(default_factory=list)  # 由本 cell 輸出連到的 cell 名稱列表
@@ -229,9 +227,8 @@ def build_cell_graph(inst,iterms,oterms,block, timing, corner, features,nodes_by
     """回傳 nodes_by_name: Dict[str, CellNode]"""
     # 1) 先為每顆 instance 建立 CellNode（先不處理 fanin/fanout）
     name   = inst.getName()
-    old_name   = inst.getName()
     master = inst.getMaster().getName()
-    nodes_by_name[name] = CellNode(name=name, old_name =old_name,master=master, features=features)
+    nodes_by_name[name] = CellNode(name=name,master=master, features=features)
 
     # 2) 掃每顆 cell 的輸出 pin，建立 fanout / fanin 關係
     for oterm in oterms:
@@ -335,7 +332,6 @@ for inst in block.getInsts():
     }
     cellgraph = build_cell_graph(inst,input_terms,output_terms,block, timing, corner, features[name],cellgraph)
 
-print(worstpinslack)
 # # ----------------------------------------------------------------------
 def compute_tns_from_graph(cellgraph):
     return sum(node.features['tns']
@@ -416,124 +412,207 @@ Path("master_to_base_map.json").write_text(json.dumps(master_to_base_map,      i
 # --------------------------模擬退火 (Simulated Annealing)----------------------------------
 import math
 import random
-# 設定隨機種子，確保每次執行結果一致
+import matplotlib.pyplot as plt
+
+plot_dict = {}
+# 設定隨機種子，確保每次執行結果不一致
 SEED = random.randint(0, 2**31 - 1)
-random.seed(544423709)
+random.seed(SEED)
 print(f"Random seed: {SEED}")
 
-# 1. 模擬退火參數設定
-T_initial      = 1e-10   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應   # 標準化
-alpha          = 0.98   # 降溫速率
-steps_per_temp = 10    # 每個溫度下的迭代次數
-iterations     = 10  # 總迭代次數
-
-# 2. 初始化狀態
+# 初始化狀態
 print("\n=== Initializing Simulated Annealing ===")
+
+# 負 slack 節點列表
+neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
+    
 update_full_slacks(cellgraph, block, timing, corner)
-current_cost = abs(compute_tns_from_graph(cellgraph))
-best_cost    = current_cost
+initial_timing_cost = abs(compute_tns_from_graph(cellgraph))
+initial_power_cost = compute_power(block,timing,corner)
+
+# # 計算cost function的tns和power權重
+# power_rate = initial_power_cost * POWER_WEIGHT 
+# timing_rate = initial_timing_cost * TIMING_WEIGHT
+# total_rate = power_rate + timing_rate
+# power_cost_weight = power_rate / total_rate
+# timing_cost_weight = timing_rate / total_rate
+
+initial_cost = initial_timing_cost #* TIMING_WEIGHT + initial_power_cost * POWER_WEIGHT
 
 # 儲存目前為止找到的最佳 cell master 指派
 # 這樣我們才能在最後恢復到最佳狀態，而不是 SA 結束時的最後狀態
 best_assignment = {inst.getName(): inst.getMaster() for inst in block.getInsts()}
 
-print(f"Initial TNS: {-current_cost} ps")
-print(f"Initial Cost (abs(TNS)): {current_cost}")
+
+# 顯示初始狀態
+print(f"Initial Power: {initial_power_cost} W")
+print(f"Initial TNS: {-initial_timing_cost} s")
+print(f"Initial Cost (abs(TNS)): {initial_timing_cost}")
+
+# print(f"Power Cost Weight: {power_cost_weight}")
+# print(f"Timing Cost Weight: {timing_cost_weight}")
+
+
+# 預熱，先執行N次，得出delta_avg
+total_bad_cost = 0.0
+N = 20
+for i in range(N):
+    print(f"\n=== Pre-warmup Iteration {i + 1} ===")
+    node_to_change = random.choice(neg_nodes)
+    inst_name = node_to_change.name
+    inst = block.findInst(inst_name)
+    
+    if not inst:
+        continue
+
+    old_master = inst.getMaster()
+    equiv_cells = timing.equivCells(old_master)
+    equiv_cells_names = [e.getName() for e in equiv_cells]
+    old_master_name = old_master.getName()
+    idx = equiv_cells_names.index(old_master_name)
+
+    # 如果沒有其他可替換的 cell，就跳過
+    if len(equiv_cells) <= 1:
+        continue
+    
+    # 隨機挑選一個新的 master
+    new_master = random.choice(equiv_cells)
+    new_master_name = new_master.getName()
+    # 確保新舊 master 不同
+    while new_master.getName() == old_master.getName():
+        new_master = random.choice(equiv_cells)
+    # 執行交換
+
+    inst.swapMaster(new_master)
+    update_full_slacks(cellgraph, block, timing, corner)
+    new_timing_cost = abs(compute_tns_from_graph(cellgraph))
+
+    # new_power_cost = compute_power(block,timing,corner)
+    new_cost = new_timing_cost #* timing_cost_weight + new_power_cost * power_cost_weight
+
+
+
+    delta_E = new_cost - initial_cost
+    # print(f"  ---> ΔE = {delta_E} (new_cost: {new_cost}, initial_cost: {initial_cost})")
+    
+    total_bad_cost += delta_E
+
+    # 恢復原狀
+    inst.swapMaster(old_master)
+    design.evalTclString(f"estimate_parasitics -placement") 
+
+# 計算預熱平均 ΔE
+avg_delta_E = total_bad_cost / N
+print(f"Average ΔE from {N} pre-warmup iterations: {avg_delta_E}")
+# # --------------------------模擬退火 (Simulated Annealing)開始----------------------------------
+design.evalTclString("report_tns")
+# 1. 模擬退火參數設定
+T_initial      = avg_delta_E   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應   
+alpha          = 0.98   # 降溫速率
+final_temp     = avg_delta_E / 100   # 終止溫度 (ps) - 當溫度低於此值時停止
+iterations     = 300  # 總迭代次數
+
+current_timing_cost = initial_timing_cost
+# current_power_cost = initial_power_cost
+current_cost = current_timing_cost #* timing_cost_weight + current_power_cost * power_cost_weight
 
 temp = T_initial
 iteration = 0
+accepted_moves = 0
 
-# 3. 模擬退火主迴圈
-while iteration < iterations:
+# 2. 模擬退火主迴圈
+while iteration < iterations or temp > final_temp:
     # 每次迭代開始時，顯示目前溫度和迭代次數
     print(f"\n=== Iteration {iteration + 1} / {iterations} ===")
-
-    # 在每個溫度開始時，更新負 slack 節點列表
-    neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
-    neg_nodes.sort(key=lambda n: n.features['slack'])
-    
+    print(f"Current Temperature: {temp} ")
+    print(f"Current TNS: {current_timing_cost} s ")
     if not neg_nodes:
         print("All timing violations resolved. Stopping early.")
         break
         
-    accepted_moves = 0
-    for i in range(steps_per_temp):
-        # 3.1) 產生一個鄰近狀態 (隨機選擇一個 cell 並 sizing)
-        # 從負 slack 的節點中隨機挑選，讓搜尋更有效率
-        if i % 10 == 0:
-            update_full_slacks(cellgraph, block, timing, corner)  # 建議同步
-            neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
-            neg_nodes.sort(key=lambda n: n.features['slack'])
-        node_to_change = random.choice(neg_nodes)
-        inst_name = node_to_change.name
-        inst = block.findInst(inst_name)
-        
-        if not inst:
-            continue
+    
+    # 3.1) 產生一個鄰近狀態 (隨機選擇一個 cell 並 sizing)
+    # 從負 slack 的節點中隨機挑選，讓搜尋更有效率
+    node_to_change = random.choice(neg_nodes)
+    inst_name = node_to_change.name
+    inst = block.findInst(inst_name)
+    
+    if not inst:
+        continue
 
-        old_master = inst.getMaster()
-        equiv_cells = timing.equivCells(old_master)
-        equiv_cells_names = [e.getName() for e in equiv_cells]
-        old_master_name = old_master.getName()
-        idx = equiv_cells_names.index(old_master_name)
+    old_master = inst.getMaster()
+    equiv_cells = timing.equivCells(old_master)
+    equiv_cells_names = [e.getName() for e in equiv_cells]
+    old_master_name = old_master.getName()
+    idx = equiv_cells_names.index(old_master_name)
 
-        # 如果沒有其他可替換的 cell，就跳過
-        if len(equiv_cells) <= 1:
-            continue
-        
-        # 隨機挑選一個新的 master
+    # 如果沒有其他可替換的 cell，就跳過
+    if len(equiv_cells) <= 1:
+        continue
+    
+    # 隨機挑選一個新的 master
+    new_master = random.choice(equiv_cells)
+    new_master_name = new_master.getName()
+    # 確保新舊 master 不同
+    while new_master.getName() == old_master.getName():
         new_master = random.choice(equiv_cells)
-        new_master_name = new_master.getName()
-        # 確保新舊 master 不同
-        while new_master.getName() == old_master.getName():
-            new_master = random.choice(equiv_cells)
-        # while equiv_cells_names.index(new_master_name) < equiv_cells_names.index(old_master_name) :
-        #     new_master = random.choice(equiv_cells)
-        # 3.2) 計算成本變化 (ΔE)
-        # 在交換前，TNS 就是目前的 current_cost
-        
-        # 執行交換
-        inst.swapMaster(new_master)
-        update_full_slacks(cellgraph, block, timing, corner)
-        new_cost = abs(compute_tns_from_graph(cellgraph))
-        # design.evalTclString("report_tns")
-        delta_E = new_cost - current_cost
 
-        # 3.3) 根據 Metropolis 準則決定是否接受新狀態
-        # 如果是更優的解 (delta_E < 0)，或者以一定機率接受較差的解
-        if delta_E < 0 or (temp > 0 and random.random() < math.exp(-delta_E / temp)):
-            # 接受新狀態
-            print('delta',delta_E)
-            print('temp',temp)
-            current_cost = new_cost
-            accepted_moves += 1
-            # 如果這個新狀態是至今為止最好的，就記錄下來
-            if current_cost < best_cost:
-                best_cost = current_cost
-                if iteration > iterations - 10 and iteration < iterations:
-                    best_assignment = {i.getName(): i.getMaster() for i in block.getInsts()}#可改
-                print(f"  ---> New best found! TNS: {-best_cost} s")
-                design.evalTclString("report_tns")
+    # 3.2) 計算成本變化 (ΔE)
+    # 在交換前，TNS 就是目前的 current_cost
+    
+    # 執行交換
+    inst.swapMaster(new_master)
+    update_full_slacks(cellgraph, block, timing, corner)
+    new_timing_cost = abs(compute_tns_from_graph(cellgraph))
+    print(f"  ---> New TNS: {new_timing_cost} s")
+    # new_power_cost = compute_power(block,timing,corner)
+    new_cost = new_timing_cost #* timing_cost_weight + new_power_cost * power_cost_weight
+    
+    delta_E = new_cost - current_cost
+    print(f"  ---> ΔE = {delta_E} ")
+    # 3.3) 根據 Metropolis 準則決定是否接受新狀態
+    # 如果是更優的解 (delta_E < 0)，或者以一定機率接受較差的解
+    if delta_E < 0 or random.random() < math.exp(delta_E / temp):
+        # 接受新狀態
+        current_timing_cost = new_timing_cost
+        # current_power_cost = new_power_cost
+        current_cost = new_cost
+        accepted_moves += 1
+        
+        if delta_E > 0:
+            temp *= alpha  # 降溫
+            print(f"  ---> Accepting worse solution with ΔE = {delta_E} at T = {temp} s probability = {math.exp(delta_E / temp)}\n"
+                  f"  ---> Current TNS: {current_timing_cost} s" )# Cost: {current_cost} | Power: {current_power_cost} W"
         else:
-            # 不接受，恢復原狀
-            inst.swapMaster(old_master)
+            print(f"  ---> New best found! TNS: {current_timing_cost} s" )#| Cost: {current_cost}#| Power: {current_power_cost} W
+    else:
+        # 不接受，恢復原狀
+        inst.swapMaster(old_master)
 
     # 顯示目前進度
-    print(f"Temp: {temp} | Current TNS: {-current_cost} s | Best TNS: {-best_cost} s | Accepted: {accepted_moves}/{steps_per_temp}")
+    if iteration % 100 == 99 :
+        design.evalTclString(f"estimate_parasitics -placement") 
+        update_full_slacks(cellgraph, block, timing, corner)
+        current_timing_cost = abs(compute_tns_from_graph(cellgraph))
+        current_cost = current_timing_cost #* timing_cost_weight + current_power_cost * power_cost_weight
+        print(f"Temp: {temp} | Current TNS: {-current_timing_cost} s | Accepted: {accepted_moves}/100")
+        
+        plot_dict[iteration] = current_timing_cost
+        accepted_moves = 0  # 重置接受計數器
 
-    # 3.4) 降溫
-    temp *= alpha
     iteration += 1
 
-# 4. 恢復到找到的最佳狀態
-print("\n=== Simulated Annealing Finished. Restoring best found state... ===")
-for inst_name, best_master in best_assignment.items():
-    inst = block.findInst(inst_name)
-    if inst:
-        inst.swapMaster(best_master)
+print("\n=== Simulated Annealing Finished.===")
+plt.plot(list(plot_dict.keys()), list(plot_dict.values()), marker='o')
+plt.xlabel('Iteration')
+plt.ylabel('TNS (s)')
+plt.title('Simulated Annealing Progress')
+plt.grid()
+plt.savefig("simulated_annealing_progress.png")
 
 # # --------------------------貪婪greeeeeeeeeedy結束----------------------------------
 # # --------------------------report---------------------------------- 
+design.evalTclString(f"estimate_parasitics -placement") 
 update_full_slacks(cellgraph, block, timing, corner)
 print("Final TNS =", compute_tns_from_graph(cellgraph))
 design.evalTclString("report_tns")
