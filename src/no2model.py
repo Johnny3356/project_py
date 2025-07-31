@@ -414,6 +414,7 @@ import math
 import random
 import matplotlib.pyplot as plt
 
+
 plot_dict = {}
 # 設定隨機種子，確保每次執行結果不一致
 SEED = random.randint(0, 2**31 - 1)
@@ -452,9 +453,9 @@ print(f"Initial Cost (abs(TNS)): {initial_timing_cost}")
 # print(f"Power Cost Weight: {power_cost_weight}")
 # print(f"Timing Cost Weight: {timing_cost_weight}")
 
-
 # 預熱，先執行N次，得出delta_avg
 total_bad_cost = 0.0
+total_bad_nums = 0
 N = 20
 for i in range(N):
     print(f"\n=== Pre-warmup Iteration {i + 1} ===")
@@ -482,29 +483,31 @@ for i in range(N):
     while new_master.getName() == old_master.getName():
         new_master = random.choice(equiv_cells)
     # 執行交換
-
     inst.swapMaster(new_master)
+
+    design.evalTclString("estimate_parasitics -placement")
     update_full_slacks(cellgraph, block, timing, corner)
+    
     new_timing_cost = abs(compute_tns_from_graph(cellgraph))
 
     # new_power_cost = compute_power(block,timing,corner)
     new_cost = new_timing_cost #* timing_cost_weight + new_power_cost * power_cost_weight
 
-
-
     delta_E = new_cost - initial_cost
-    # print(f"  ---> ΔE = {delta_E} (new_cost: {new_cost}, initial_cost: {initial_cost})")
-    
-    total_bad_cost += delta_E
+    print(f"  ---> ΔE = {delta_E} (new_cost: {new_cost}, initial_cost: {initial_cost})")
+
+    if delta_E > 0:
+        total_bad_cost += delta_E
+        total_bad_nums += 1
 
     # 恢復原狀
     inst.swapMaster(old_master)
-    design.evalTclString(f"estimate_parasitics -placement") 
 
 # 計算預熱平均 ΔE
-avg_delta_E = total_bad_cost / N
-print(f"Average ΔE from {N} pre-warmup iterations: {avg_delta_E}")
+avg_delta_E = total_bad_cost / total_bad_nums if total_bad_nums > 0 else 0.0
+print(f"Average ΔE from {N} pre-warmup iterations: {avg_delta_E} total_bad_nums: {total_bad_nums}/{N}")
 # # --------------------------模擬退火 (Simulated Annealing)開始----------------------------------
+design.evalTclString("estimate_parasitics -placement")
 design.evalTclString("report_tns")
 # 1. 模擬退火參數設定
 T_initial      = avg_delta_E   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應   
@@ -521,7 +524,7 @@ iteration = 0
 accepted_moves = 0
 
 # 2. 模擬退火主迴圈
-while iteration < iterations or temp > final_temp:
+while iteration < iterations and temp > final_temp:
     # 每次迭代開始時，顯示目前溫度和迭代次數
     print(f"\n=== Iteration {iteration + 1} / {iterations} ===")
     print(f"Current Temperature: {temp} ")
@@ -562,6 +565,8 @@ while iteration < iterations or temp > final_temp:
     
     # 執行交換
     inst.swapMaster(new_master)
+
+    design.evalTclString("estimate_parasitics -placement")  
     update_full_slacks(cellgraph, block, timing, corner)
     new_timing_cost = abs(compute_tns_from_graph(cellgraph))
     print(f"  ---> New TNS: {new_timing_cost} s")
@@ -572,7 +577,7 @@ while iteration < iterations or temp > final_temp:
     print(f"  ---> ΔE = {delta_E} ")
     # 3.3) 根據 Metropolis 準則決定是否接受新狀態
     # 如果是更優的解 (delta_E < 0)，或者以一定機率接受較差的解
-    if delta_E < 0 or random.random() < math.exp(delta_E / temp):
+    if delta_E < 0 or random.random() < math.exp(-delta_E / temp) and delta_E != 0:
         # 接受新狀態
         current_timing_cost = new_timing_cost
         # current_power_cost = new_power_cost
@@ -581,25 +586,29 @@ while iteration < iterations or temp > final_temp:
         
         if delta_E > 0:
             temp *= alpha  # 降溫
-            print(f"  ---> Accepting worse solution with ΔE = {delta_E} at T = {temp} s probability = {math.exp(delta_E / temp)}\n"
+            print(f"  ---> Accepting worse solution with ΔE = {delta_E} at T = {temp} s probability = {math.exp(-delta_E / temp)}\n"
                   f"  ---> Current TNS: {current_timing_cost} s" )# Cost: {current_cost} | Power: {current_power_cost} W"
         else:
             print(f"  ---> New best found! TNS: {current_timing_cost} s" )#| Cost: {current_cost}#| Power: {current_power_cost} W
     else:
+        if delta_E == 0 :
+            print(f" {inst_name} from {old_master_name} to {new_master_name} | No change in TNS, skipping.")
+        elif delta_E > 0:
+            print(f"  ---> Rejecting worse solution with ΔE = {delta_E} at T = {temp} s probability = {math.exp(-delta_E / temp)}\n")
         # 不接受，恢復原狀
         inst.swapMaster(old_master)
-
+    
     # 顯示目前進度
     if iteration % 100 == 99 :
-        design.evalTclString(f"estimate_parasitics -placement") 
+        design.evalTclString("estimate_parasitics -placement") 
         update_full_slacks(cellgraph, block, timing, corner)
         current_timing_cost = abs(compute_tns_from_graph(cellgraph))
         current_cost = current_timing_cost #* timing_cost_weight + current_power_cost * power_cost_weight
         print(f"Temp: {temp} | Current TNS: {-current_timing_cost} s | Accepted: {accepted_moves}/100")
         
-        plot_dict[iteration] = current_timing_cost
         accepted_moves = 0  # 重置接受計數器
 
+    plot_dict[iteration] = current_timing_cost
     iteration += 1
 
 print("\n=== Simulated Annealing Finished.===")
@@ -612,11 +621,6 @@ plt.savefig("simulated_annealing_progress.png")
 
 # # --------------------------貪婪greeeeeeeeeedy結束----------------------------------
 # # --------------------------report---------------------------------- 
-design.evalTclString(f"estimate_parasitics -placement") 
-update_full_slacks(cellgraph, block, timing, corner)
-print("Final TNS =", compute_tns_from_graph(cellgraph))
-design.evalTclString("report_tns")
-design.evalTclString("report_wns")  
 # # ---------------------------buffer-------------------------------------
 # design.evalTclString("estimate_parasitics -placement")
 # design.evalTclString("repair_design -match_cell_footprint  -max_wire_length 10 ") 
@@ -632,6 +636,7 @@ displacements = compute_displacements(before_centers, after_centers)
 # # ----------------------------detailed placement-------------------------------------
 # # ---------------------------------final report-------------------------------------
 # 最後一次 full STA／報告
+design.evalTclString("estimate_parasitics -placement") 
 update_full_slacks(cellgraph, block, timing, corner)
 print("Final TNS =", compute_tns_from_graph(cellgraph))
 print("seed:", SEED)
