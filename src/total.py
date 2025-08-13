@@ -7,22 +7,47 @@ import re
 import json
 from dataclasses import dataclass, field
 from typing import Dict, List,Union, Tuple
+import sys
+import argparse
+import time
+import random
+import csv
+import math
 # ----------------------------------------------------------------------
 # 1. 先找出「src 目錄」的絕對路徑，再推導 workspace 根目錄
 # ----------------------------------------------------------------------
-THIS_PY   = Path(__file__).resolve()          # /mnt/c/.../iccad_c/src/run_rl.py
-SRC_DIR   = THIS_PY.parent                    # /mnt/c/.../iccad_c/src
-WORKSPACE = SRC_DIR.parent                    # /mnt/c/.../iccad_c
+start_time = time.time()
 
+parser = argparse.ArgumentParser(description="Run design optimization")
+parser.add_argument('--design', type=str, required=True, help='Design name')
+parser.add_argument('--wl', type=float, required=True, help='Wirelength weight')
+parser.add_argument('--power', type=float, required=True, help='Power weight')
+parser.add_argument('--timing', type=float, required=True, help='Timing weight')
+args = parser.parse_args()
+
+design_name    = args.design
+WL_WEIGHT     = args.wl
+POWER_WEIGHT  = args.power
+TIMING_WEIGHT = args.timing
+
+THIS_PY   = Path(__file__).resolve()          # no2.py
+SRC_DIR   = THIS_PY.parent                    # solution/project_py/src
+WORKSPACE = SRC_DIR.parent                    # solution/project_py
+MAIN_DIR  = WORKSPACE.parent                  # solution
+DESIGN_PATH = MAIN_DIR / "ICCAD25_PorbC"
 # 1.1. 組出 testcase、lib、lef、def 的完整路徑
-TESTCASE_DIR = WORKSPACE / "ICCAD25_PorbC" / "ASAP7"
-LIB_DIR      = TESTCASE_DIR / "LIB"
-LEF_DIR      = TESTCASE_DIR / "LEF" 
-TECH_LEF_DIR      = TESTCASE_DIR / "techlef" 
+TESTCASE_DIR = DESIGN_PATH / "ICCAD25_testcases"
+ASAP7_DIR = DESIGN_PATH / "ASAP7"
+CELL_INFO_DIR = TESTCASE_DIR / design_name
+LIB_DIR      = ASAP7_DIR / "LIB"
+LEF_DIR      = ASAP7_DIR / "LEF" 
+TECH_LEF_DIR      = ASAP7_DIR / "techlef" 
 TECH_LEF_FILE = TECH_LEF_DIR / "asap7_tech_1x_201209.lef"
-DEF_FILE     = WORKSPACE / "ICCAD25_PorbC" / "aes_cipher_top" / "aes_cipher_top.def"
-SDC_FILE     = WORKSPACE / "ICCAD25_PorbC" / "aes_cipher_top" / "aes_cipher_top.sdc"
-RC_TCL       = WORKSPACE / "ICCAD25_PorbC" / "ASAP7" / "setRC.tcl"
+DEF_FILE     = CELL_INFO_DIR /  f"{design_name}.def"
+SDC_FILE     = CELL_INFO_DIR /  f"{design_name}.sdc"
+# DEF_FILE     = CELL_INFO_DIR / "aes_cipher_top.def"
+# SDC_FILE     = CELL_INFO_DIR/ "aes_cipher_top.sdc"
+RC_TCL       = ASAP7_DIR / "setRC.tcl"
 # ----------------------------------------------------------------------
 # 2) 讀 LEF ── 先 tech LEF，再 stdcell/其他
 # ----------------------------------------------------------------------
@@ -48,7 +73,7 @@ def parse_size(s: str) -> float:
         return float(a + '.' + b)
     return float(body)
 
-VT_ORDER    = ["SL","R","L","SRAM"]
+VT_ORDER    = ["SL","L","R","SRAM"]
 cell_def_re = re.compile(r'^\s*cell\s*\(\s*([A-Za-z0-9_]+)\s*\)\s*\{')
 pin_re      = re.compile(r'^\s*pin\s*\(\s*(\w+)\s*\)\s*\{.*direction\s*:\s*"output"')
 
@@ -184,7 +209,7 @@ design.readDef(str(DEF_FILE))
 # 2.4) 其他文件：SDC / set_rc 等
 # ----------------------------------------------------------------------
 design.evalTclString(f"read_sdc {SDC_FILE}")
-design.evalTclString(f"source   {RC_TCL}")     # 你沒有 SPEF 時，用 set_rc.tcl
+design.evalTclString(f"source   {RC_TCL}")     # 沒有 SPEF 時，用 set_rc.tcl
 design.evalTclString(f"estimate_parasitics -placement") 
 
 sta = tech.getSta()
@@ -228,8 +253,6 @@ def build_cell_graph(inst,iterms,oterms,block, timing, corner, features,nodes_by
 
     return nodes_by_name
 # # ---------------------------第一次parse----------------------------------
-
-
 worstpinslack = 0.0
 features = {}
 cellgraph: Dict[str, CellNode] = {}
@@ -314,9 +337,8 @@ for inst in block.getInsts():
         'sibling_cap': sibling_cap
     }
     cellgraph = build_cell_graph(inst,input_terms,output_terms,block, timing, corner, features[name],cellgraph)
-
 print(worstpinslack)
-# # ----------------------------------------------------------------------
+# # ---------------------------function areas------------------------------------
 def compute_tns_from_graph(cellgraph):
     return sum(node.features['tns']
                for node in cellgraph.values() )
@@ -328,16 +350,18 @@ def compute_power(block,timing,corner):
                for n in cellgraph)
     dyn_p    = sum(timing.dynamicPower(block.findInst(n), corner)
                for n in cellgraph)
-    return static_p + dyn_p      
+    return static_p + dyn_p  
+def cost_function(cellgraph,block,timing,corner,initial_tns,initial_power,alpha,gamma): #alpha for tns,gamma for power 到時候繳交時要改吃run.sh的參數
+    # power = compute_power(block,timing,corner)/initial_power
+    tns =  compute_tns_from_graph(cellgraph)/initial_tns
+    return alpha * tns 
 def update_full_slacks(cellgraph: Dict[str, CellNode],
                   block, timing, corner) -> None:
     for inst in block.getInsts():
         name = inst.getName()
         # 只算 SIGNAL 的 input pin slack
-        input_terms = [
-            it for it in inst.getITerms()
-            if it.isInputSignal() and it.getNet().getSigType()=="SIGNAL"
-        ]
+        input_terms = [it for it in inst.getITerms() if it.isInputSignal() and it.getNet().getSigType()=="SIGNAL"]
+        output_terms = [it for it in inst.getITerms() if it.isOutputSignal()]
         slacks = []
         endpoints = []
         total_n_slack = 0.0
@@ -353,8 +377,20 @@ def update_full_slacks(cellgraph: Dict[str, CellNode],
             worst_slack = min(slack_r, slack_f)
             if worst_slack < 0:
                 total_n_slack += worst_slack
+        in_arr  = [timing.getPinArrival(it, timing.Rise) for it in input_terms]
+        out_arr = [timing.getPinArrival(ot, timing.Rise) for ot in output_terms]
+        arc_delay = (max(out_arr) - max(in_arr)) if in_arr and out_arr else 0.0
+
+        in_slews = [timing.getPinSlew(it) for it in input_terms]
+        in_slew  = max(in_slews) if in_slews else 0.0
+        out_slews = [timing.getPinSlew(ot) for ot in output_terms]
+        out_slew  = max(out_slews) if out_slews else 0.0
+        
+        cellgraph[name].features['in_slew'] = in_slew
+        cellgraph[name].features['out_slew'] = out_slew
         cellgraph[name].features['slack'] = min(slacks) if slacks else 0.0
         cellgraph[name].features['tns'] = total_n_slack
+        cellgraph[name].features['arc_delay'] = arc_delay
 def get_instance_centers(design) -> Dict[str, Tuple[float,float]]:
     """
     返回字典:inst_name -> (x_center, y_center)
@@ -370,10 +406,7 @@ def get_instance_centers(design) -> Dict[str, Tuple[float,float]]:
         
         centers[inst.getName()] = (x, y)
     return centers
-def compute_displacements(
-    before: Dict[str, Tuple[float,float]],
-    after:  Dict[str, Tuple[float,float]]
-) -> Dict[str, Tuple[float,float]]:
+def compute_displacements(before: Dict[str, Tuple[float,float]],after:  Dict[str, Tuple[float,float]]) -> Dict[str, Tuple[float,float]]:
     """
     返回 inst_name -> (dx, dy) 的位移字典，只对在 before 和 after 中都出现的 inst 计算。
     """
@@ -383,36 +416,55 @@ def compute_displacements(
             x1, y1 = after[name]
             disp[name] = (x1 - x0, y1 - y0)
     return disp
-
-# 1. 先讓 STA 準備好等價 cell group
-timing.makeEquivCells()
+# # ----------------------------------------------------------------------
+timing.makeEquivCells()# 讓 STA 準備好等價 cell group
 master_to_base_map = {}
 for base_name, full_names in full_name_dict.items():
     for fn in full_names:
         master_to_base_map[fn] = base_name
-Path("master_to_base_map.json").write_text(json.dumps(master_to_base_map,      indent=2))
+before_centers = get_instance_centers(design)
+site = design.getBlock().getRows()[0].getSite()
 # # ----------------------------------------------------------------------
-seed_tns = compute_tns_from_graph(cellgraph)
-print("First TNS =", seed_tns)
+# --------------------------模擬退火 (Simulated Annealing)----------------------------------
+import math
+import random
+
+# 設定隨機種子，確保每次執行結果一致
+SEED = random.randint(0, 2**31 - 1)
+random.seed(SEED)
+print(f"Random seed: {SEED}")
+
+# 1. 初始化狀態
+print("\n=== Initializing Simulated Annealing ===")
+update_full_slacks(cellgraph, block, timing, corner)
+initial_tns = compute_tns_from_graph(cellgraph) #負號小於0
+initial_power = abs(compute_power(block,timing,corner))
+current_tns = compute_tns_from_graph(cellgraph) #負號小於0
+current_cost = abs(cost_function(cellgraph,block,timing,corner,initial_tns,initial_power,1,1))  # 是正的 # current_cost = abs(compute_tns_from_graph(cellgraph))
+best_cost    = current_cost
+
+print(f"Initial TNS: {initial_tns} ps")
+print(f"Initial Cost (abs(TNS)): {current_cost}")
+eco_map = OrderedDict()
 # # --------------------------貪婪greeeeeeeeeedy----------------------------------
-# 2. 篩選出所有 slack < 0 的節點，並按 slack 越負越前排序
 N = 150
-neg_nodes = [node for node in cellgraph.values() if node.features['slack'] < 0.0]
-neg_nodes.sort(key=lambda n: n.features['slack'])
-for i, node in enumerate(neg_nodes[:N]):
-    inst_name = node.name
-    inst = block.findInst(inst_name)
-    if not inst:
-        continue
-    old_master = inst.getMaster()
-    old_master_name = old_master.getName()
-    equivCells_masters = timing.equivCells(old_master)
-    equivCells_masters_names = [e.getName() for e in equivCells_masters]
-    idx = equivCells_masters_names.index(old_master_name)
-    if idx + 3 < len(equivCells_masters):
-        inst.swapMaster(equivCells_masters[idx+3]) 
+# neg_nodes = [node for node in cellgraph.values() if node.features['slack'] < 0.0]# 篩選出所有 slack < 0 的節點，並按 slack 越負越前排序
+# neg_nodes.sort(key=lambda n: n.features['slack'])
+# for i, node in enumerate(neg_nodes[:N]):
+#     inst_name = node.name
+#     inst = block.findInst(inst_name)
+#     if not inst:
+#         continue
+#     old_master = inst.getMaster()
+#     old_master_name = old_master.getName()
+#     equivCells_masters = timing.equivCells(old_master)
+#     equivCells_masters_names = [e.getName() for e in equivCells_masters]
+#     idx = equivCells_masters_names.index(old_master_name)
+#     if idx + 3 < len(equivCells_masters):
+#         inst.swapMaster(equivCells_masters[idx+3]) 
 # # ----------------------------------------------------------------------
 # 3. 對最嚴重的前 N 顆做 sizing（這裡示範 N=50，可視需求調整）
+# design.evalTclString(f"estimate_parasitics -placement") 
 update_full_slacks(cellgraph, block, timing, corner)
 seed_tns = compute_tns_from_graph(cellgraph)
 print("First TNS =", seed_tns)
@@ -462,6 +514,7 @@ for epoch in range(8):
     
             # 暫時應用 Sizing
             inst.swapMaster(new_master)
+            # design.evalTclString("estimate_parasitics -placement")
             update_full_slacks(cellgraph,block,timing,corner)
             design.evalTclString("report_tns")
             # new_tns = float(design.evalTclString("report_tns").split()[0])
@@ -495,72 +548,64 @@ for epoch in range(8):
             
     N -= 20
     print(a,b)
+    design.evalTclString(f"estimate_parasitics -placement") 
 # # --------------------------貪婪greeeeeeeeeedy結束----------------------------------
 # # --------------------------report---------------------------------- 
 update_full_slacks(cellgraph, block, timing, corner)
 print("Final TNS =", compute_tns_from_graph(cellgraph))
 design.evalTclString("report_tns")
 design.evalTclString("report_wns")  
-# # --------------------------moveeeeeeeeee---------------------------------- 
-design.evalTclString("improve_placement") 
-design.evalTclString("report_tns")
-# neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
-# neg_nodes.sort(key=lambda n: n.features['slack'])
-# for i, node in enumerate(neg_nodes[:N]):
-#     inst_name = node.name
-#     inst = block.findInst(inst_name)
-#     if not inst:
-#         continue
-#     box = inst.getBBox()
-#     # 取 BBox 中心
-#     inst_x = 0.5 * (box.xMin() + box.xMax())
-#     inst_y = 0.5 * (box.yMin() + box.yMax())
-#     x_in_lists = []
-#     y_in_lists = []
-#     for in_node in node.fanin_cells:
-#         in_node_inst = block.findInst(in_node)
-#         in_node_inst_name = in_node_inst.getName()
-#         box = in_node_inst.getBBox()
-#         in_node_inst_x = 0.5 * (box.xMin() + box.xMax())
-#         in_node_inst_y = 0.5 * (box.yMin() + box.yMax())
-#         x_in_lists.append(in_node_inst_x)
-#         y_in_lists.append(in_node_inst_y)
-#         ava_xin = sum(x_in_inst for x_in_inst in x_in_lists)/len(x_in_lists)
-#         ava_yin = sum(y_in_inst for y_in_inst in y_in_lists)/len(y_in_lists)
-#         delta_x = inst_x - ava_xin  
-#         delta_y = inst_y - ava_yin  
-#         new_x_min = box.xMin() - delta_x/10
-#         new_x_max = box.xMax() - delta_x/10
-#         new_y_min = box.yMin() - delta_y/10
-#         new_y_max = box.yMax() - delta_y/10
-#         in_node_inst.setBBox(new_x_min, new_y_min, new_x_max, new_y_max)
-# # ---------------------------moveeeeeeee-------------------------------------
 # # ---------------------------buffer-------------------------------------
 # design.evalTclString("estimate_parasitics -placement")
 # design.evalTclString("repair_design -match_cell_footprint  -max_wire_length 10 ") 
 # # ---------------------------buffer-------------------------------------    
 # # ----------------------------detailed placement-------------------------------------
-before_centers = get_instance_centers(design)
-site = design.getBlock().getRows()[0].getSite()
-max_disp_x = int(design.micronToDBU(4) / site.getWidth())
-max_disp_y = int(design.micronToDBU(4) / site.getHeight())
+design.evalTclString("improve_placement") 
+max_disp_x = int(design.micronToDBU(6) / site.getWidth())
+max_disp_y = int(design.micronToDBU(6) / site.getHeight())
 design.getOpendp().detailedPlacement(max_disp_x, max_disp_y, "dpl_failures.txt",)
-design.getOpendp().reportLegalizationStats()
 after_centers = get_instance_centers(design)
 displacements = compute_displacements(before_centers, after_centers)
 # # ----------------------------detailed placement-------------------------------------
 # # ---------------------------------final report-------------------------------------
 # 最後一次 full STA／報告
+# design.evalTclString("report_tns")
+design.evalTclString(f"estimate_parasitics -placement") 
 update_full_slacks(cellgraph, block, timing, corner)
 print("Final TNS =", compute_tns_from_graph(cellgraph))
 design.evalTclString("report_tns")
 design.evalTclString("report_wns")
 total_abs_dx = sum(abs(dx) for dx, dy in displacements.values())
 total_abs_dy = sum(abs(dy) for dx, dy in displacements.values())
-print(f"Total |Δx| = {total_abs_dx:.3f} μm, Total |Δy| = {total_abs_dy:.3f} μm")
+total = total_abs_dx +total_abs_dy
+print(f"Total |Δx| = {0.001*total_abs_dx:.3f} μm, Total |Δy| = {0.001*total_abs_dy:.3f} μm,Total displacement = {0.001*total:.3f} μm")
 design.evalTclString("report_power")
+print(f"Random seed: {SEED}")
 # # ---------------------------------final report-------------------------------------
+# # ---------------------------------csv file列印--------------------------------------
+csv_file = Path("sa_runs_aes_cipher_top.csv")
+is_new = not csv_file.exists()
+with csv_file.open("a", newline="") as f:
+    writer = csv.writer(f)
+    if is_new:                         # 第一次先寫表頭
+        writer.writerow(["timestamp", "design", "seed", "iterations","final_tns","final power","final displacement"])
+    writer.writerow([time.strftime("%F %T"),  # 2025-07-30 17:05:21
+                    "aes_cipher_top",        # 或自己填 design 名DESIGN_PATH.name
+                    SEED,
+                    iterations * steps_per_temp ,
+                    compute_tns_from_graph(cellgraph),
+                    compute_power(block,timing,corner),
+                    total ])
+# # ---------------------------------csv file列印--------------------------------------
 # # -----------------------------write def-----------------------------------------
 db.endEco(block)
-design.writeDef("final.def")
-# design.getDb().writeEco(block,"eco_changelist.eco")
+design.writeDef(f"{design_name}.sol.def")
+with open(f"{design_name}.sol.changelist", "w") as f:
+    for inst_name, libcell in eco_map.items():
+        f.write(f"size_cell {inst_name} {libcell}\n")
+ending_time = time.time()
+elapsed_time = ending_time - start_time
+print(f"Total elapsed time: {elapsed_time:.2f} seconds")
+# # -----------------------------write def-----------------------------------------
+# # -----------------------------last report-----------------------------------------  
+
