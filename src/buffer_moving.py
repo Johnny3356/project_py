@@ -621,7 +621,7 @@ for lib in libs:
         libcell_name = master.getName()# Get the name of the library cell
         if design.isBuffer(master):
             buffer_master_list.append(master)
-buffer_idx = int(len(buffer_master_list)-1)
+buffer_idx = int(len(buffer_master_list)-2)
 equiv_cells = timing.equivCells(buffer_master_list[0])
 buffer_master_list = equiv_cells 
 nets = block.getNets()
@@ -645,9 +645,9 @@ for net in nets:
         'length': netRouteLength,
         'fanout': fanOut
     }
-sorted_with_length_nets = sorted(nets_dict.items(),key=lambda item: item[1]['length'],reverse=True)   # fanout排序的nets list
+sorted_with_length_nets = sorted(nets_dict.items(),key=lambda item: item[1]['fanout'],reverse=True)   # fanout排序的nets list
 buffer_name_idx = 1
-for name,sorted_with_length_net_dict in sorted_with_length_nets[:25]:
+for name,sorted_with_length_net_dict in sorted_with_length_nets[:30]:
     old_buffer_net = sorted_with_length_net_dict['net']
     net_ITerms = old_buffer_net.getITerms()
     center_x_list = []
@@ -665,10 +665,7 @@ for name,sorted_with_length_net_dict in sorted_with_length_nets[:25]:
             net_driver_pins.append(net_ITerm)
     x_center = int(sum(center_x_list)/len(center_x_list))
     y_center = int(sum(center_y_list)/len(center_y_list))
-    if center_x_list is None:
-        continue
-    if center_y_list is None:
-        continue
+
     new_buffer_name = f"buffer{buffer_name_idx}"
     buffer_name_idx += 1
     new_buffer_master = buffer_master_list[buffer_idx] #master
