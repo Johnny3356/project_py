@@ -225,8 +225,19 @@ timing_paths = parse_sta_report(rpt) #rpt總路徑
 print(f"Parsed {len(timing_paths)} violated path(s) written to parsed_paths_detailed.txt and parsed_paths.json")
 for timing_path in timing_paths:
     cells = [c for c in timing_path["cells"] if c.get("delay") is not None]
+    # clk_cells = [c for c in timing_path["cells"] if c["input_pin"] == "CLK"]
     cells_sorted = sorted(cells, key=lambda c: c["delay"], reverse=True)
+    for c in timing_path["cells"]:
+        pin = str(c.get("input_pin","")).strip()
+        if pin.upper().startswith("CLK"):
+            clk_net_name = c.get("input_net")
+            break
+    if clk_net_name:
+        break  # 找到就不必繼續
     timing_path["cells"] = cells_sorted
+# clk_net_name = clk_cells[0]['input_net']
+print(clk_net_name)
+clk_net = block.findNet(clk_net_name)
 with open(out_json, "w", encoding="utf-8") as f_json:
         # ensure_ascii=False 保留中文，indent=2 美化输出
         json.dump(timing_paths, f_json, indent=2, ensure_ascii=False)
@@ -360,6 +371,57 @@ print(worstpinslack)
 def compute_tns_from_graph(cellgraph):
     return sum(node.features['tns']
                for node in cellgraph.values() )
+def compute_tns_via_endpoints(design, timing):
+    """
+    以端點為單位計算 TNS，與 OpenSTA report_tns 定義一致：
+    - 對每個 endpoint 的 rise/fall 兩個 check，各自若為負值就累加
+    - 同時涵蓋 ITerms 與 BTerms
+    mode: "setup" -> Max (path_delay max), "hold" -> Min (path_delay min)
+    """
+    block = design.getBlock()
+    sense = timing.Max 
+
+    total = 0.0
+
+    # ITerms（實例腳位，常見如 D pin）
+    for inst in block.getInsts():
+        for it in inst.getITerms():
+            # 部分電源腳/無 net 的腳位跳過
+            try:
+                net = it.getNet()
+                if net is None:
+                    continue
+            except Exception:
+                continue
+            # 只對 endpoint 累加
+            if not timing.isEndpoint(it):
+                continue
+
+            sr = timing.getPinSlack(it, timing.Rise, sense)
+            sf = timing.getPinSlack(it, timing.Fall, sense)
+            if sr < 0.0:
+                total += sr
+            if sf < 0.0:
+                total += sf
+
+    # BTerms（主輸出/輸入等）
+    for bt in block.getBTerms():
+        # 不是訊號腳位也可直接跳過（有些設計不需要，但保守處理）
+        try:
+            if not timing.isEndpoint(bt):
+                continue
+        except Exception:
+            # 某些版本需要用 BPins 取點，視 API 支援度而定
+            continue
+
+        sr = timing.getPinSlack(bt, timing.Rise, sense)
+        sf = timing.getPinSlack(bt, timing.Fall, sense)
+        if sr < 0.0:
+            total += sr
+        if sf < 0.0:
+            total += sf
+
+    return total
 def compute_fake_tns_from_graph(cellgraph):
     return sum(node.features['slack']
                for node in cellgraph.values() if node.features['slack'] < 0.0 )
@@ -497,7 +559,6 @@ for timing_path1 in timing_paths:
     worst_paths_nets_dict[f"{idx}"] = worst_path_nets_dict
     idx += 1
 # # ----------------------------------------------------------------------
-
 def _inst_center(inst):
     bb = inst.getBBox()
     return 0.5 * (bb.xMin() + bb.xMax()), 0.5 * (bb.yMin() + bb.yMax())
@@ -610,6 +671,139 @@ tns = compute_tns_from_graph(cellgraph)
 design.evalTclString("report_wns")
 design.evalTclString("report_tns")
 # # --------------------------------buffer list--------------------------------------
+# def insert_buffer_in_clk_net(net,odb,block,buffer_master_list,buffer_idx,buffer_name_idx,_inst_center,_inst_size):
+#     i = 0
+#     net_ITerms = net.getITerms()
+#     center_x_list = []
+#     center_y_list = []
+#     net_sink_pins = []
+#     net_driver_pins = []
+#     for net_ITerm in net_ITerms:
+#         cell = net_ITerm.getInst()
+#         center_x,center_y = _inst_center(cell)
+#         center_x_list.append(center_x)
+#         center_y_list.append(center_y)
+#         if net_ITerm.isInputSignal() is True:
+#             net_sink_pins.append(net_ITerm)
+#         if net_ITerm.isOutputSignal() is True:
+#             net_driver_pins.append(net_ITerm)
+#     if not center_x_list or not center_y_list:
+#         return buffer_name_idx  # 回傳原本的 index，不做事
+#     x_center = int(sum(center_x_list)/len(center_x_list))
+#     y_center = int(sum(center_y_list)/len(center_y_list))
+#     new_buffer_name = f"buffer{buffer_name_idx}"
+#     buffer_name_idx += 1
+#     new_buffer_master = buffer_master_list[buffer_idx] #master
+#     new_buffer = odb.dbInst_create(block, new_buffer_master,  f"buffer{buffer_name_idx}")#後面是name
+#     dx,dy = _inst_size(new_buffer)
+#     new_buffer.setLocation(x_center - dx,y_center - dy)
+#     new_buffer.setPlacementStatus("PLACED")
+
+#     new_buffer_output_pins = [c for c in new_buffer.getITerms() if c.isOutputSignal()]
+#     new_buffer_input_pins  = [c for c in new_buffer.getITerms() if c.isInputSignal()]
+#     new_buffer_net = odb.dbNet_create(block, f"net_buffer{buffer_name_idx}")#後面是name;net
+#     for new_buffer_output_pin in new_buffer_output_pins:
+#         new_buffer_output_pin.connect(new_buffer_net)
+#     for new_buffer_input_pin in new_buffer_input_pins:
+#         new_buffer_input_pin.connect(net)
+#     for net_sink_pin in net_sink_pins:
+#         net_sink_pin.disconnect()
+#         net_sink_pin.connect(new_buffer_net)
+#     return buffer_name_idx
+def insert_buffer5_in_clk_net(net, odb, block, buffer_master_list, buffer_idx,
+                             buffer_name_idx, _inst_center, _inst_size):
+    """
+    在 net 上做「扇出分割」：將所有 sink 分成每組最多 5 個，
+    每組插入一顆 buffer，buffer 輸出接該組 sinks，buffer 輸入仍接在原 net 上。
+    回傳更新後的 buffer_name_idx。
+    """
+    # 1) 蒐集 sinks / drivers（僅使用 ITerms；若需要也可擴充 BTerms）
+    sinks = []
+    drivers = []
+    for it in list(net.getITerms()):  # 轉成 list 避免遍歷中修改連線
+        if it.isInputSignal():
+            sinks.append(it)
+        elif it.isOutputSignal():
+            drivers.append(it)
+
+    # 沒有 sink 就不做事
+    if not sinks:
+        return buffer_name_idx
+
+    # 2) 依空間位置排序後「每 5 個一組」分組（簡單且效果通常不錯）
+    #    這邊用 instance center 的 x 做排序，也可以改成 y 或 k-means 聚類
+    def iterm_center(it):
+        inst = it.getInst()
+        return _inst_center(inst)  # (cx, cy)
+
+    sinks_sorted = sorted(sinks, key=lambda it: iterm_center(it)[0])
+
+    def chunk(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i+n]
+
+    sink_groups = list(chunk(sinks_sorted, 10))
+
+    # 3) 每組建立一顆 buffer：輸入接原 net、輸出接新 net，再把該組 sinks 轉接到新 net
+    buf_master = buffer_master_list[buffer_idx]  # 你給的 master（通常是 BUFx/CLKBUF）
+    sig_type = net.getSigType()                  # 保留 CLOCK / SIGNAL 屬性
+
+    for group in sink_groups:
+        # 3.1) 決定 buffer 擺放位置：取該組 sinks 所屬 cell 的幾何中心
+        xs, ys = [], []
+        for it in group:
+            cx, cy = iterm_center(it)
+            xs.append(cx); ys.append(cy)
+        if xs and ys:
+            gx = int(sum(xs) / len(xs))
+            gy = int(sum(ys) / len(ys))
+        else:
+            # fallback：用原 net 連線的所有 cell 的中心平均
+            all_cx = []; all_cy = []
+            for it in net.getITerms():
+                cx, cy = _inst_center(it.getInst())
+                all_cx.append(cx); all_cy.append(cy)
+            if not all_cx:
+                continue
+            gx = int(sum(all_cx)/len(all_cx))
+            gy = int(sum(all_cy)/len(all_cy))
+
+        # 3.2) 建立 buffer instance（名稱與 net 名稱都用遞增 index 確保唯一）
+        buf_name = f"buffer{buffer_name_idx}"
+        new_buf = odb.dbInst_create(block, buf_master, buf_name)
+        dx, dy = _inst_size(new_buf)  # cell 寬高（DBU）
+        # 放在該組中心（約略置中），你也可以改成 gx, gy 直接放或靠近 driver
+        new_buf.setLocation(gx - dx // 2, gy - dy // 2)
+        new_buf.setPlacementStatus("PLACED")
+
+        # 3.3) 取得 buffer 的輸入/輸出腳位
+        buf_inputs  = [t for t in new_buf.getITerms() if t.isInputSignal()]
+        buf_outputs = [t for t in new_buf.getITerms() if t.isOutputSignal()]
+        if not buf_inputs or not buf_outputs:
+            # master 不是標準的 1in/1out，略過本組
+            new_buf.destroy(new_buf)  # 清乾淨
+            continue
+
+        # 3.4) 新建一條 net 當作 buffer 輸出網，並標成與原 net 相同 SigType（如 CLOCK）
+        out_net_name = f"net_buffer{buffer_name_idx}"
+        out_net = odb.dbNet_create(block, out_net_name)
+        out_net.setSigType(sig_type)
+
+        # 3.5) 連線：buffer 輸出 -> out_net；buffer 輸入 -> 原 net
+        for bo in buf_outputs:
+            bo.connect(out_net)
+        for bi in buf_inputs:
+            bi.connect(net)
+
+        # 3.6) 把本組 sinks 從原 net 轉接到 out_net
+        for it in group:
+            it.disconnect()
+            it.connect(out_net)
+
+        # 下一顆 buffer 的編號
+        buffer_name_idx += 1
+
+    return buffer_name_idx
 db = ord.get_db()# Get OpenDB
 libs = db.getLibs()# Get all cell libraries from different files (if multiple .lib files are read)
 buffer_master_list = [] #所有可用buffer type list
@@ -645,9 +839,10 @@ for net in nets:
         'length': netRouteLength,
         'fanout': fanOut
     }
-sorted_with_length_nets = sorted(nets_dict.items(),key=lambda item: item[1]['length'],reverse=True)   # fanout排序的nets list
+sorted_with_length_nets = sorted(nets_dict.items(),key=lambda item: item[1]['fanout'],reverse=True)   # fanout排序的nets list
 buffer_name_idx = 1
-for name,sorted_with_length_net_dict in sorted_with_length_nets[:25]:
+buffer_name_idx = insert_buffer5_in_clk_net(clk_net,odb,block,buffer_master_list,buffer_idx,buffer_name_idx,_inst_center,_inst_size)
+for name,sorted_with_length_net_dict in sorted_with_length_nets[:10]:
     old_buffer_net = sorted_with_length_net_dict['net']
     net_ITerms = old_buffer_net.getITerms()
     center_x_list = []
@@ -663,12 +858,12 @@ for name,sorted_with_length_net_dict in sorted_with_length_nets[:25]:
             net_sink_pins.append(net_ITerm)
         if net_ITerm.isOutputSignal() is True:
             net_driver_pins.append(net_ITerm)
+    if len(center_x_list) == 0:
+        continue
+    if len(center_y_list) == 0:
+        continue
     x_center = int(sum(center_x_list)/len(center_x_list))
     y_center = int(sum(center_y_list)/len(center_y_list))
-    if center_x_list is None:
-        continue
-    if center_y_list is None:
-        continue
     new_buffer_name = f"buffer{buffer_name_idx}"
     buffer_name_idx += 1
     new_buffer_master = buffer_master_list[buffer_idx] #master
@@ -687,16 +882,19 @@ for name,sorted_with_length_net_dict in sorted_with_length_nets[:25]:
     for net_sink_pin in net_sink_pins:
         net_sink_pin.disconnect()
         net_sink_pin.connect(new_buffer_net)
+# buffer_name_idx = insert_buffer_in_clk_net(clk_net,odb,block,buffer_master_list,buffer_idx,buffer_name_idx,_inst_center,_inst_size)
 # # --------------------------------buffer list--------------------------------------
 # 合法化 + 重新估 parasitics + 報告 TNS/WNS
 design.evalTclString("detailed_placement")  # 合法化實例位置
 # design.evalTclString("estimate_parasitics -placement")
 update_full_slacks(cellgraph,block,timing,corner)
 tns = compute_tns_from_graph(cellgraph)
+ttns = compute_tns_via_endpoints(design, timing)
 design.evalTclString("report_wns")
 design.evalTclString("report_tns")
 design.evalTclString("report_power")
 print("[After move] TNS:\n", tns)
+print("[After move] TTNS:\n", tns)
 design.evalTclString("report_tns")
 
 ending_time = time.time()
