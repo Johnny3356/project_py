@@ -408,17 +408,26 @@ for base_name, full_names in full_name_dict.items():
     for fn in full_names:
         master_to_base_map[fn] = base_name
 Path("master_to_base_map.json").write_text(json.dumps(master_to_base_map,      indent=2))
+
+# # ----------------------------------------------------------------------
+
 # # ----------------------------------------------------------------------
 # --------------------------模擬退火 (Simulated Annealing)----------------------------------
 import math
 import random
 import matplotlib.pyplot as plt
-
+WEIGHT = 0.8
 plot_dict = {}
 # 設定隨機種子，確保每次執行結果不一致
 SEED = random.randint(0, 2**31 - 1)
 random.seed(SEED)
 print(f"Random seed: {SEED}")
+critical_cell = []
+
+before_centers = get_instance_centers(design)
+site = design.getBlock().getRows()[0].getSite()
+max_disp_x = int(design.micronToDBU(6) / site.getWidth())
+max_disp_y = int(design.micronToDBU(6) / site.getHeight())
 
 # 初始化狀態
 print("\n=== Initializing Simulated Annealing ===")
@@ -427,6 +436,7 @@ print("\n=== Initializing Simulated Annealing ===")
 neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
     
 update_full_slacks(cellgraph, block, timing, corner)
+
 initial_timing_cost = abs(compute_tns_from_graph(cellgraph))
 initial_power_cost = compute_power(block,timing,corner)
 
@@ -452,13 +462,13 @@ print(f"Initial Cost (abs(TNS)): {initial_timing_cost}")
 # print(f"Power Cost Weight: {power_cost_weight}")
 # print(f"Timing Cost Weight: {timing_cost_weight}")
 
-
 # 預熱，先執行N次，得出delta_avg
 total_bad_cost = 0.0
+total_bad_nums = 0
 N = 20
 for i in range(N):
     print(f"\n=== Pre-warmup Iteration {i + 1} ===")
-    node_to_change = random.choice(neg_nodes)
+    node_to_change = random.choice(neg_nodes) if neg_nodes else None
     inst_name = node_to_change.name
     inst = block.findInst(inst_name)
     
@@ -471,6 +481,23 @@ for i in range(N):
     old_master_name = old_master.getName()
     idx = equiv_cells_names.index(old_master_name)
 
+    smaller_cells = equiv_cells[:idx]
+    larger_cells  = equiv_cells[idx+1:]
+    if len(smaller_cells) == 0:
+        equiv_cells = larger_cells
+        print(f"  ---> No smaller cells available")
+    elif len(larger_cells) == 0:
+        equiv_cells = smaller_cells
+        print(f"  ---> No larger cells available")
+    else:
+        weight = random.random()
+        if weight < WEIGHT: # 70% 機率選擇較大的 cell
+            equiv_cells = larger_cells
+            print(f"  ---> Choosing larger cells")
+        else:
+            equiv_cells = smaller_cells
+            print(f"  ---> Choosing smaller cells")
+    
     # 如果沒有其他可替換的 cell，就跳過
     if len(equiv_cells) <= 1:
         continue
@@ -482,35 +509,37 @@ for i in range(N):
     while new_master.getName() == old_master.getName():
         new_master = random.choice(equiv_cells)
     # 執行交換
-
     inst.swapMaster(new_master)
+
+    design.evalTclString("estimate_parasitics -placement")
     update_full_slacks(cellgraph, block, timing, corner)
+    
     new_timing_cost = abs(compute_tns_from_graph(cellgraph))
 
     # new_power_cost = compute_power(block,timing,corner)
     new_cost = new_timing_cost #* timing_cost_weight + new_power_cost * power_cost_weight
 
-
-
     delta_E = new_cost - initial_cost
-    # print(f"  ---> ΔE = {delta_E} (new_cost: {new_cost}, initial_cost: {initial_cost})")
-    
-    total_bad_cost += delta_E
+    print(f"  ---> ΔE = {delta_E} (new_cost: {new_cost}, initial_cost: {initial_cost})")
+
+    if delta_E > 0:
+        total_bad_cost += delta_E
+        total_bad_nums += 1
 
     # 恢復原狀
     inst.swapMaster(old_master)
-    design.evalTclString(f"estimate_parasitics -placement") 
 
 # 計算預熱平均 ΔE
-avg_delta_E = total_bad_cost / N
-print(f"Average ΔE from {N} pre-warmup iterations: {avg_delta_E}")
+avg_delta_E = total_bad_cost / total_bad_nums if total_bad_nums > 0 else 0.0
+print(f"Average ΔE from {N} pre-warmup iterations: {avg_delta_E} total_bad_nums: {total_bad_nums}/{N}")
 # # --------------------------模擬退火 (Simulated Annealing)開始----------------------------------
+design.evalTclString("estimate_parasitics -placement")
 design.evalTclString("report_tns")
 # 1. 模擬退火參數設定
 T_initial      = avg_delta_E   # 初始溫度 (ps) - TNS 的數量級約為數千 ps，溫度要相對應   
 alpha          = 0.98   # 降溫速率
 final_temp     = avg_delta_E / 100   # 終止溫度 (ps) - 當溫度低於此值時停止
-iterations     = 300  # 總迭代次數
+iterations     = 1000  # 總迭代次數
 
 current_timing_cost = initial_timing_cost
 # current_power_cost = initial_power_cost
@@ -519,9 +548,11 @@ current_cost = current_timing_cost #* timing_cost_weight + current_power_cost * 
 temp = T_initial
 iteration = 0
 accepted_moves = 0
+last_inst = None
+stuck_iterations = 0
 
 # 2. 模擬退火主迴圈
-while iteration < iterations or temp > final_temp:
+while iteration < iterations and temp > final_temp:
     # 每次迭代開始時，顯示目前溫度和迭代次數
     print(f"\n=== Iteration {iteration + 1} / {iterations} ===")
     print(f"Current Temperature: {temp} ")
@@ -533,7 +564,8 @@ while iteration < iterations or temp > final_temp:
     
     # 3.1) 產生一個鄰近狀態 (隨機選擇一個 cell 並 sizing)
     # 從負 slack 的節點中隨機挑選，讓搜尋更有效率
-    node_to_change = random.choice(neg_nodes)
+    neg_nodes.sort(key=lambda n: n.features['drv_load'],reverse = True)  # 按 slack 排序，最大的在前面
+    node_to_change = neg_nodes[0] if neg_nodes else None
     inst_name = node_to_change.name
     inst = block.findInst(inst_name)
     
@@ -546,9 +578,26 @@ while iteration < iterations or temp > final_temp:
     old_master_name = old_master.getName()
     idx = equiv_cells_names.index(old_master_name)
 
-    # 如果沒有其他可替換的 cell，就跳過
-    if len(equiv_cells) <= 1:
-        continue
+    print(f"Current Cell: {node_to_change.name if node_to_change else 'N/A'}")
+    print(f"Current Instance: {inst_name if inst_name else 'N/A'}")
+
+
+    smaller_cells = equiv_cells[:idx]
+    larger_cells  = equiv_cells[idx+1:]
+    if len(smaller_cells) == 0:
+        equiv_cells = larger_cells
+        print(f"  ---> No smaller cells available")
+    elif len(larger_cells) == 0:
+        equiv_cells = smaller_cells
+        print(f"  ---> No larger cells available")
+    else:
+        weight = random.random()
+        if weight < WEIGHT: # 70% 機率選擇較大的 cell
+            equiv_cells = larger_cells
+            print(f"  ---> Choosing larger cells")
+        else:
+            equiv_cells = smaller_cells
+            print(f"  ---> Choosing smaller cells")
     
     # 隨機挑選一個新的 master
     new_master = random.choice(equiv_cells)
@@ -557,11 +606,16 @@ while iteration < iterations or temp > final_temp:
     while new_master.getName() == old_master.getName():
         new_master = random.choice(equiv_cells)
 
+    print(f"  ---> New Master: {new_master.getName()}")
+
     # 3.2) 計算成本變化 (ΔE)
     # 在交換前，TNS 就是目前的 current_cost
     
     # 執行交換
     inst.swapMaster(new_master)
+
+    design.evalTclString("estimate_parasitics -placement")  
+    # design.getOpendp().detailedPlacement(max_disp_x, max_disp_y, "dpl_failures.txt",)
     update_full_slacks(cellgraph, block, timing, corner)
     new_timing_cost = abs(compute_tns_from_graph(cellgraph))
     print(f"  ---> New TNS: {new_timing_cost} s")
@@ -572,68 +626,76 @@ while iteration < iterations or temp > final_temp:
     print(f"  ---> ΔE = {delta_E} ")
     # 3.3) 根據 Metropolis 準則決定是否接受新狀態
     # 如果是更優的解 (delta_E < 0)，或者以一定機率接受較差的解
-    if delta_E < 0 or random.random() < math.exp(delta_E / temp):
+    if delta_E < 0 or random.random() < math.exp(-delta_E / temp) and delta_E != 0:
         # 接受新狀態
+        reduce_percent = -delta_E / current_cost if current_cost != 0 else 0
+
         current_timing_cost = new_timing_cost
         # current_power_cost = new_power_cost
         current_cost = new_cost
         accepted_moves += 1
-        
+
+        if reduce_percent > 0.07:
+            critical_cell.append(node_to_change)
+            print(f"  ---> Critical Cell Found: {inst_name}, reduce_percent = {reduce_percent*100}%")
         if delta_E > 0:
             temp *= alpha  # 降溫
-            print(f"  ---> Accepting worse solution with ΔE = {delta_E} at T = {temp} s probability = {math.exp(delta_E / temp)}\n"
+            print(f"  ---> Accepting worse solution with ΔE = {delta_E} at T = {temp} s probability = {math.exp(-delta_E / temp)}\n"
                   f"  ---> Current TNS: {current_timing_cost} s" )# Cost: {current_cost} | Power: {current_power_cost} W"
         else:
             print(f"  ---> New best found! TNS: {current_timing_cost} s" )#| Cost: {current_cost}#| Power: {current_power_cost} W
     else:
+        if delta_E == 0 :
+            print(f" {inst_name} from {old_master_name} to {new_master_name} | No change in TNS, skipping.")
+        elif delta_E > 0:
+            print(f"  ---> Rejecting worse solution with ΔE = {delta_E} at T = {temp} s probability = {math.exp(-delta_E / temp)}\n")
+        
+        if stuck_iterations >= 5 :
+            neg_node = neg_nodes.pop(0)
+            print(f"Negative Node Has Been Popped: {neg_node.name if neg_node else 'N/A'}")
+            stuck_iterations = 0
+
         # 不接受，恢復原狀
         inst.swapMaster(old_master)
-
+    
     # 顯示目前進度
     if iteration % 100 == 99 :
-        design.evalTclString(f"estimate_parasitics -placement") 
+        design.evalTclString("estimate_parasitics -placement")
+        # design.getOpendp().detailedPlacement(max_disp_x, max_disp_y, "dpl_failures.txt",)
         update_full_slacks(cellgraph, block, timing, corner)
         current_timing_cost = abs(compute_tns_from_graph(cellgraph))
         current_cost = current_timing_cost #* timing_cost_weight + current_power_cost * power_cost_weight
         print(f"Temp: {temp} | Current TNS: {-current_timing_cost} s | Accepted: {accepted_moves}/100")
         
-        plot_dict[iteration] = current_timing_cost
         accepted_moves = 0  # 重置接受計數器
 
+    plot_dict[iteration] = current_timing_cost
+    if last_inst and last_inst == inst_name:
+        stuck_iterations += 1
+    else:
+        stuck_iterations = 0
+    last_inst = inst_name  # 儲存最後一次處理的 instance 名稱
     iteration += 1
 
 print("\n=== Simulated Annealing Finished.===")
-plt.plot(list(plot_dict.keys()), list(plot_dict.values()), marker='o')
-plt.xlabel('Iteration')
-plt.ylabel('TNS (s)')
-plt.title('Simulated Annealing Progress')
-plt.grid()
-plt.savefig("simulated_annealing_progress.png")
-
 # # --------------------------貪婪greeeeeeeeeedy結束----------------------------------
 # # --------------------------report---------------------------------- 
-design.evalTclString(f"estimate_parasitics -placement") 
-update_full_slacks(cellgraph, block, timing, corner)
-print("Final TNS =", compute_tns_from_graph(cellgraph))
-design.evalTclString("report_tns")
-design.evalTclString("report_wns")  
 # # ---------------------------buffer-------------------------------------
 # design.evalTclString("estimate_parasitics -placement")
 # design.evalTclString("repair_design -match_cell_footprint  -max_wire_length 10 ") 
 # # ---------------------------buffer-------------------------------------    
 # # ----------------------------detailed placement-------------------------------------
-before_centers = get_instance_centers(design)
-site = design.getBlock().getRows()[0].getSite()
-max_disp_x = int(design.micronToDBU(6) / site.getWidth())
-max_disp_y = int(design.micronToDBU(6) / site.getHeight())
+
 design.getOpendp().detailedPlacement(max_disp_x, max_disp_y, "dpl_failures.txt",)
 after_centers = get_instance_centers(design)
 displacements = compute_displacements(before_centers, after_centers)
 # # ----------------------------detailed placement-------------------------------------
 # # ---------------------------------final report-------------------------------------
 # 最後一次 full STA／報告
+design.evalTclString("estimate_parasitics -placement") 
 update_full_slacks(cellgraph, block, timing, corner)
-print("Final TNS =", compute_tns_from_graph(cellgraph))
+final_tns = compute_tns_from_graph(cellgraph)
+print("Final TNS =", final_tns)
 print("seed:", SEED)
 design.evalTclString("report_tns")
 design.evalTclString("report_wns")
@@ -641,6 +703,12 @@ total_abs_dx = sum(abs(dx) for dx, dy in displacements.values())
 total_abs_dy = sum(abs(dy) for dx, dy in displacements.values())
 print(f"Total |Δx| = {total_abs_dx} μm, Total |Δy| = {total_abs_dy} μm")
 design.evalTclString("report_power")
+plt.plot(list(plot_dict.keys()), list(plot_dict.values()), marker='o')
+plt.xlabel('Iteration')
+plt.ylabel('TNS (s)')
+plt.title('Simulated Annealing Progress')
+plt.grid()
+plt.savefig(f"seed{SEED}_tns{(final_tns*1e12):.0f}.png")
 # # ---------------------------------final report-------------------------------------
 # # -----------------------------write def-----------------------------------------
 db.endEco(block)
