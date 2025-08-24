@@ -206,9 +206,6 @@ design.readDef(str(DEF_FILE))
 design.evalTclString(f"read_sdc {SDC_FILE}")
 design.evalTclString(f"source   {RC_TCL}")     # 沒有 SPEF 時，用 set_rc.tcl
 design.evalTclString(f"estimate_parasitics -placement")
-design.evalTclString(f"report_checks -path_delay max -fields {{slew cap input fanout net}} -format full_clock_expanded -slack_max 0.000 -group_path_count 1000000 > {design_name}.setup.rpt")
-rpt = f"{design_name}.setup.rpt"
- 
 
 sta = tech.getSta()
 wns = design.evalTclString("report_wns")
@@ -218,30 +215,6 @@ timing = Timing(design)
 corner = timing.getCorners()[0]  
 block = design.getBlock()
 db.beginEco(block)
-# ----------------------------------------------------------------------
-  # 改成你的報告檔名
-out_json = f"{design_name}.parsed.json"
-timing_paths = parse_sta_report(rpt) #rpt總路徑
-print(f"Parsed {len(timing_paths)} violated path(s) written to parsed_paths_detailed.txt and parsed_paths.json")
-for timing_path in timing_paths:
-    cells = [c for c in timing_path["cells"] if c.get("delay") is not None]
-    # clk_cells = [c for c in timing_path["cells"] if c["input_pin"] == "CLK"]
-    cells_sorted = sorted(cells, key=lambda c: c["delay"], reverse=True)
-    for c in timing_path["cells"]:
-        pin = str(c.get("input_pin","")).strip()
-        if pin.upper().startswith("CLK"):
-            clk_net_name = c.get("input_net")
-            break
-    if clk_net_name:
-        break  # 找到就不必繼續
-    timing_path["cells"] = cells_sorted
-# clk_net_name = clk_cells[0]['input_net']
-print(clk_net_name)
-clk_net = block.findNet(clk_net_name)
-with open(out_json, "w", encoding="utf-8") as f_json:
-        # ensure_ascii=False 保留中文，indent=2 美化输出
-        json.dump(timing_paths, f_json, indent=2, ensure_ascii=False)
-# # ----------------------------------------------------------------------
 # # ----------------------------------------------------------------------
 @dataclass
 class CellNode:
@@ -382,8 +355,17 @@ def compute_power(block,timing,corner):
     return static_p + dyn_p  
 def cost_function(cellgraph,block,timing,corner,initial_tns,initial_power,alpha,gamma): #alpha for tns,gamma for power 到時候繳交時要改吃run.sh的參數
     # power = compute_power(block,timing,corner)/initial_power
-    tns =  compute_tns_from_graph(cellgraph)/initial_tns
-    return alpha * tns 
+    # tns =  abs(compute_tns_from_graph(cellgraph)/initial_tns)
+    # return (alpha * tns + gamma * power)/(alpha+gamma) 
+    return compute_tns_from_graph(cellgraph)
+def cost_function2(cellgraph,block,timing,corner,initial_tns,initial_power,alpha,gamma,iter,ppower):
+    if iter % 10 == 0: #alpha for tns,gamma for power 到時候繳交時要改吃run.sh的參數
+        power = compute_power(block,timing,corner)/initial_power
+        tns =  abs(compute_tns_from_graph(cellgraph)/initial_tns)
+        return (alpha * tns + gamma * power)/(alpha+gamma) , power
+    else:
+        tns =  abs(compute_tns_from_graph(cellgraph)/initial_tns)
+        return (alpha * tns + gamma * ppower)/(alpha+gamma) , ppower
 def update_full_slacks(cellgraph: Dict[str, CellNode],
                   block, timing, corner) -> None:
     for inst in block.getInsts():
@@ -472,43 +454,8 @@ def compute_displacements(before: Dict[str, Tuple[float,float]],after:  Dict[str
 before_centers = get_instance_centers(design)
 site = design.getBlock().getRows()[0].getSite()
 # # ----------------------------------------------------------------------
-def get_iterm(block, inst_name, pin_name):
-    inst = block.findInst(inst_name)
-    if inst is None:
-        return None
-    for it in inst.getITerms():                      # dbITerm
-        if it.getMTerm().getName() == pin_name:      # mterm名：如 "A","Y","CLK","QN"
-            return it
-    return None
-worst_paths_nets_dict = {}
-idx = 0
-for timing_path1 in timing_paths:
-    worst_path_nets_dict = {}
-    for net_name in timing_path1['net'].keys():
-        if timing_path1['net'][net_name]['sink'] is None or timing_path1['net'][net_name]['driver'] is None :
-            continue
-        net = block.findNet(net_name)
-        slew = timing_path1['net'][net_name]['driver']['slew']
-        driver_inst = block.findInst(timing_path1['net'][net_name]['driver']['inst'])
-        driver_pin = get_iterm(block,
-                      timing_path1['net'][net_name]['driver']['inst'],
-                      timing_path1['net'][net_name]['driver']['pin'])
-        sinker_inst = block.findInst(timing_path1['net'][net_name]['sink']['inst'])
-        sinker_pin = get_iterm(block,
-                      timing_path1['net'][net_name]['sink']['inst'],
-                      timing_path1['net'][net_name]['sink']['pin'])
 
-        worst_path_nets_dict[net_name] = {
-            'net' : net,
-            'slew' : slew,
-            'driver_inst' : driver_inst,
-            'driver_pin' : driver_pin,
-            'sinker_inst' : sinker_inst,
-            'sinker_pin' : sinker_pin
-        }
-    worst_path_nets_dict = dict(sorted(worst_path_nets_dict.items(), key=lambda item: item[1]['slew'], reverse=True))
-    worst_paths_nets_dict[f"{idx}"] = worst_path_nets_dict
-    idx += 1
+
 # # ----------------------------------------------------------------------
 def _inst_center(inst):
     bb = inst.getBBox()
@@ -592,35 +539,36 @@ def get_driver_and_sinks_from_net(net):
     return drivers, sinks
 # ---------- 主要流程：每條 path 取前兩個 net，把兩端 inst 互相靠近 ----------
 # 去重：避免同一對 inst 在多個 net 被重複推動
-_seen_pairs = set()
+# _seen_pairs = set()
 
-# 走訪每一條 path
-top100 = list(worst_paths_nets_dict.items())[:100]
-for path_idx, path_nets in top100:
-    # 取出該 path 的前兩個 net（你前面已經依 slew 排序過）
-    top2 = list(path_nets.items())[:2]  # [(net_name, info), ...]
+# # 走訪每一條 path
+# top100 = list(worst_paths_nets_dict.items())[:100]
+# for path_idx, path_nets in top100:
+#     # 取出該 path 的前兩個 net（你前面已經依 slew 排序過）
+#     top2 = list(path_nets.items())[:2]  # [(net_name, info), ...]
 
-    for net_name, info in top2:
-        a_inst = info['driver_inst']
-        b_inst = info['sinker_inst']
-        if a_inst is None or b_inst is None:
-            continue
-        # 用 frozenset 去重（(A,B) 與 (B,A) 視為同一對）
-        key = frozenset((a_inst.getName(), b_inst.getName()))
-        if key in _seen_pairs:
-            continue
-        _seen_pairs.add(key)
+#     for net_name, info in top2:
+#         a_inst = info['driver_inst']
+#         b_inst = info['sinker_inst']
+#         if a_inst is None or b_inst is None:
+#             continue
+#         # 用 frozenset 去重（(A,B) 與 (B,A) 視為同一對）
+#         key = frozenset((a_inst.getName(), b_inst.getName()))
+#         if key in _seen_pairs:
+#             continue
+#         _seen_pairs.add(key)
 
-        _move_pair_toward_each_other(block, a_inst, b_inst, fraction=0.001)
-        update_full_slacks(cellgraph,block,timing,corner)
-        tns = compute_tns_from_graph(cellgraph)
+#         _move_pair_toward_each_other(block, a_inst, b_inst, fraction=0.001)
+#         update_full_slacks(cellgraph,block,timing,corner)
+#         tns = compute_tns_from_graph(cellgraph)
 # ---------- 主要流程：每條 path 取前兩個 net，把兩端 inst 互相靠近 ----------
 # design.evalTclString("detailed_placement")  # 合法化實例位置
-design.evalTclString("estimate_parasitics -placement")
-update_full_slacks(cellgraph,block,timing,corner)
-tns = compute_tns_from_graph(cellgraph)
-design.evalTclString("report_wns")
-design.evalTclString("report_tns")
+# design.evalTclString("estimate_parasitics -placement")
+# update_full_slacks(cellgraph,block,timing,corner)
+# tns = compute_tns_from_graph(cellgraph)
+# design.evalTclString("report_wns")
+# design.evalTclString("report_tns")
+
 # # --------------------------------buffer list--------------------------------------
 # def insert_buffer5_in_clk_net(net, odb, block, buffer_master_list, buffer_idx,
     #                          buffer_name_idx, _inst_center, _inst_size):
@@ -716,7 +664,212 @@ design.evalTclString("report_tns")
     #     buffer_name_idx += 1
 
     # return buffer_name_idx
+timing.makeEquivCells()
+design.evalTclString(f"estimate_parasitics -placement") 
+update_full_slacks(cellgraph, block, timing, corner)
+initial_tns = compute_tns_from_graph(cellgraph)
+initial_power = compute_power(block,timing,corner)
+print("First TNS =", initial_tns)
+print("First power =", initial_power)
+# ======================================================================
+# ============== 模擬退火 (Simulated Annealing) 主程式 ===============
+# ======================================================================
 
+# --- 1. SA 參數設定 ---
+# 這些參數需要根據 design 的複雜度進行調整 (tuning)
+T_INITIAL = 1e-7          # 初始溫度，設為 1.0 因為我們的成本已經正規化
+T_MIN = 1e-8             # 終止溫度
+ALPHA = 0.98             # 降溫速率 (Cooling rate)
+STEPS_PER_TEMP = 50     # 每個溫度下要嘗試的步數 (迭代次數)
+
+# 設定隨機種子以重現結果
+SEED = random.randint(0, 2**31 - 1)
+random.seed(SEED)
+print(f"Random seed: {SEED}")
+
+current_tns = initial_tns
+current_power = initial_power
+current_cost = cost_function(cellgraph,block,timing,corner,initial_tns,initial_power,TIMING_WEIGHT,POWER_WEIGHT)
+
+# 記錄整個過程中找到的最佳解
+best_cost = current_cost
+best_eco_map = {} # 儲存最佳解的 cell sizing 方案
+best_tns = current_tns
+best_power = current_power
+
+# print(f"Initial TNS: {initial_tns:.2f} ps")
+# print(f"Initial Power: {initial_power*1000:.4f} mW")
+print(f"Initial Cost: {current_cost:.4f}")
+
+# --- 3. 演算法主迴圈 ---
+temp = T_INITIAL
+iteration = 0
+
+while temp > T_MIN:
+    accepted_moves = 0
+    
+    print(f"\n--- Temperature: {temp:.6f} ---")
+    update_full_slacks(cellgraph, block, timing, corner)
+    neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
+    if not neg_nodes:
+        print("No negative slack nodes found. Annealing might stop early.")
+        break
+    for step in range(STEPS_PER_TEMP):
+        # a. 產生鄰近狀態 (Generate a Neighbor)
+        # 策略：從有負 slack 的 cell 中隨機選一個來改，讓搜尋更有效率
+        
+            
+        node_to_change = random.choice(neg_nodes[:150])
+        inst = block.findInst(node_to_change.name)
+        if not inst: continue
+        
+        old_master = inst.getMaster()
+        old_master_name = old_master.getName()
+        equiv_cells = timing.equivCells(old_master)
+        equivCells_masters_names = [e.getName() for e in equiv_cells]
+        idx = equivCells_masters_names.index(old_master_name)
+
+        if len(equiv_cells) <= 1: continue
+        
+        # 3) 构造 upsizing 候选（往后找更大 drive‑strength）
+        # cand_masters_names = []
+        # for j in (idx-3,idx-2,idx-1,idx+3,idx+2,idx+1,idx+4):
+        #     if 0 <= j < len(equiv_cells) :
+        #         cand_masters_names.append(equivCells_masters_names[j])
+
+        # # 如果没有更强的就跳过
+        # if not cand_masters_names:
+        #     a += 1
+        #     continue
+
+        # # 隨機選擇一個不同的 master
+        # new_master_name = random.choice(cand_masters_names)
+        # new_master = None
+        # for equiv_master in equiv_cells:
+        #     if new_master_name == equiv_master.getName():
+        #         new_master = equiv_master
+        #         break
+
+        # if new_master is None:
+        #     # 沒找到，保守處理：跳過
+        #     continue
+        new_master = random.choice(equiv_cells)
+        new_master_name = new_master.getName()
+        # 確保新舊 master 不同
+        while new_master.getName() == old_master.getName():
+            new_master = random.choice(equiv_cells)
+        # b. 評估新狀態
+        inst.swapMaster(new_master)
+        design.evalTclString("estimate_parasitics -placement") # <<<<< 關鍵！
+        update_full_slacks(cellgraph, block, timing, corner)
+        new_tns = compute_tns_from_graph(cellgraph)
+        new_power = compute_power(block,timing,corner)
+        new_cost = cost_function(cellgraph,block,timing,corner,initial_tns,initial_power,TIMING_WEIGHT,POWER_WEIGHT)
+        
+        delta_E = new_cost - current_cost
+        print(f"de: {delta_E}")
+        print(f"cc:{current_cost}")
+
+        # c. Metropolis 接受準則
+        if delta_E < 0 or random.random() < math.exp(-delta_E / temp):
+            # 接受新狀態
+            current_cost = new_cost
+            current_tns = new_tns
+            current_power = new_power
+            accepted_moves += 1
+            
+            # 更新目前的 eco map (這裡簡化為只記錄最後一次的變化)
+            # 在真實應用中，需要更複雜的 map 來追蹤所有變化
+            best_eco_map[inst.getName()] = new_master.getName()
+
+            # 如果這個新狀態是至今為止最好的，就記錄下來
+            if current_cost < best_cost:
+                best_tns = current_tns
+                best_power = current_power
+                best_cost = current_cost
+                # best_eco_map_snapshot = best_eco_map.copy() # 建立快照
+                print(f"  ---> New best found! Cost: {best_cost:.4f} (TNS: {best_tns}, Power: {best_power} mW)")
+        else:
+            # 不接受，恢復原狀
+            inst.swapMaster(old_master)
+            # 為了狀態一致性，恢復後也應重新估算。但為求速度，也可省略此步
+            # design.evalTclString("estimate_parasitics -placement") 
+
+    # d. 降溫
+    temp *= ALPHA
+    iteration += 1
+    
+    # 輸出目前溫度的統計數據
+    print(f"  Accepted {accepted_moves}/{STEPS_PER_TEMP} moves. Current cost: {best_cost:.4f}")
+
+    if not neg_nodes: break # 如果沒有負 slack cell 了，可以提前結束
+
+# --- 4. 恢復到找到的最佳狀態 ---
+print("\n=== Simulated Annealing Finished. Restoring best found state... ===")
+
+# ----------------------------------------------------------------------
+design.evalTclString(f"report_checks -path_delay max -fields {{slew cap input fanout net}} -format full_clock_expanded -slack_max 0.000 -group_path_count 1000000 > {design_name}.setup.rpt")
+rpt = f"{design_name}.setup.rpt"
+out_json = f"{design_name}.parsed.json"
+timing_paths = parse_sta_report(rpt) #rpt總路徑
+print(f"Parsed {len(timing_paths)} violated path(s) written to parsed_paths_detailed.txt and parsed_paths.json")
+for timing_path in timing_paths:
+    cells = [c for c in timing_path["cells"] if c.get("delay") is not None]
+    # clk_cells = [c for c in timing_path["cells"] if c["input_pin"] == "CLK"]
+    cells_sorted = sorted(cells, key=lambda c: c["delay"], reverse=True)
+    for c in timing_path["cells"]:
+        pin = str(c.get("input_pin","")).strip()
+        if pin.upper().startswith("CLK"):
+            clk_net_name = c.get("input_net")
+            break
+    if clk_net_name:
+        break  # 找到就不必繼續
+    timing_path["cells"] = cells_sorted
+# clk_net_name = clk_cells[0]['input_net']
+print(clk_net_name)
+clk_net = block.findNet(clk_net_name)
+with open(out_json, "w", encoding="utf-8") as f_json:
+        # ensure_ascii=False 保留中文，indent=2 美化输出
+        json.dump(timing_paths, f_json, indent=2, ensure_ascii=False)
+
+def get_iterm(block, inst_name, pin_name):
+    inst = block.findInst(inst_name)
+    if inst is None:
+        return None
+    for it in inst.getITerms():                      # dbITerm
+        if it.getMTerm().getName() == pin_name:      # mterm名：如 "A","Y","CLK","QN"
+            return it
+    return None
+worst_paths_nets_dict = {}
+idx = 0
+for timing_path1 in timing_paths:
+    worst_path_nets_dict = {}
+    for net_name in timing_path1['net'].keys():
+        if timing_path1['net'][net_name]['sink'] is None or timing_path1['net'][net_name]['driver'] is None :
+            continue
+        net = block.findNet(net_name)
+        slew = timing_path1['net'][net_name]['driver']['slew']
+        driver_inst = block.findInst(timing_path1['net'][net_name]['driver']['inst'])
+        driver_pin = get_iterm(block,
+                      timing_path1['net'][net_name]['driver']['inst'],
+                      timing_path1['net'][net_name]['driver']['pin'])
+        sinker_inst = block.findInst(timing_path1['net'][net_name]['sink']['inst'])
+        sinker_pin = get_iterm(block,
+                      timing_path1['net'][net_name]['sink']['inst'],
+                      timing_path1['net'][net_name]['sink']['pin'])
+
+        worst_path_nets_dict[net_name] = {
+            'net' : net,
+            'slew' : slew,
+            'driver_inst' : driver_inst,
+            'driver_pin' : driver_pin,
+            'sinker_inst' : sinker_inst,
+            'sinker_pin' : sinker_pin
+        }
+    worst_path_nets_dict = dict(sorted(worst_path_nets_dict.items(), key=lambda item: item[1]['slew'], reverse=True))
+    worst_paths_nets_dict[f"{idx}"] = worst_path_nets_dict
+    idx += 1
+# # ----------------------------------------------------------------------
 def insert_buffer5_in_clk_net(net, odb, block, buffer_master_list, buffer_idx,
                              buffer_name_idx, _inst_center, _inst_size,max_per_group):
     """
@@ -810,88 +963,6 @@ def insert_buffer5_in_clk_net(net, odb, block, buffer_master_list, buffer_idx,
                              buffer_name_idx, _inst_center, _inst_size,max_per_group)
 
     return buffer_name_idx
-# def insert_buffer5_in_clk_net(net, odb, block, buffer_master_list, buffer_idx,
-#                              buffer_name_idx, _inst_center, _inst_size,
-#                              max_per_group=5, max_levels=10):
-#     # 每一層都在同一條原始 net 上做 fanout 分層
-#     sig_type = net.getSigType()
-
-#     level = 0
-#     prev_sink_cnt = None
-
-#     while True:
-#         # 取快照（避免邊走邊改造成遍歷問題）
-#         sinks = [it for it in list(net.getITerms()) if it.isInputSignal()]
-
-#         # 終止條件 1：已經 ≤ 5
-#         if len(sinks) <= max_per_group:
-#             break
-
-#         # 終止條件 2：安全擋（sink 沒變少就停，避免無限迴圈）
-#         if prev_sink_cnt is not None and len(sinks) >= prev_sink_cnt:
-#             print(f"[WARN] sink count did not decrease: {len(sinks)} (level={level}) — stop to avoid infinite loop")
-#             break
-#         prev_sink_cnt = len(sinks)
-
-#         # 終止條件 3：層數上限
-#         if level >= max_levels:
-#             print(f"[WARN] reached max_levels={max_levels}, stop building tree")
-#             break
-
-#         # 依 x 座標排序並切成每組最多 5
-#         def iterm_center(it):
-#             return _inst_center(it.getInst())
-
-#         sinks_sorted = sorted(sinks, key=lambda it: iterm_center(it)[0])
-
-#         def chunk(lst, n):
-#             for i in range(0, len(lst), n):
-#                 yield lst[i:i+n]
-
-#         sink_groups = list(chunk(sinks_sorted, max_per_group))
-
-#         # 針對每一組建立一顆 buffer
-#         buf_master = buffer_master_list[buffer_idx]
-#         for group in sink_groups:
-#             # 幾何中心
-#             xs, ys = [], []
-#             for it in group:
-#                 cx, cy = iterm_center(it)
-#                 xs.append(cx); ys.append(cy)
-#             gx = int(sum(xs)/len(xs)); gy = int(sum(ys)/len(ys))
-
-#             # 建 buffer
-#             buf_name = f"buffer{buffer_name_idx}"
-#             new_buf = odb.dbInst_create(block, buf_master, buf_name)
-#             dx, dy = _inst_size(new_buf)
-#             new_buf.setLocation(gx - dx // 2, gy - dy // 2)
-#             new_buf.setPlacementStatus("PLACED")
-
-#             # 腳位
-#             buf_inputs  = [t for t in new_buf.getITerms() if t.isInputSignal()]
-#             buf_outputs = [t for t in new_buf.getITerms() if t.isOutputSignal()]
-
-#             # buffer output net
-#             out_net = odb.dbNet_create(block, f"net_buffer{buffer_name_idx}")
-#             out_net.setSigType(sig_type)
-
-#             # 連線
-#             for bo in buf_outputs:
-#                 bo.connect(out_net)
-#             for bi in buf_inputs:
-#                 bi.connect(net)
-
-#             # 把這組 sinks 從原 net 轉到 out_net
-#             for it in group:
-#                 it.disconnect()
-#                 it.connect(out_net)
-
-#             buffer_name_idx += 1
-
-#         level += 1
-
-#     return buffer_name_idx
-
 db = ord.get_db()# Get OpenDB
 libs = db.getLibs()# Get all cell libraries from different files (if multiple .lib files are read)
 buffer_master_list = [] #所有可用buffer type list
@@ -930,7 +1001,7 @@ for net in nets:
 sorted_with_length_nets = sorted(nets_dict.items(),key=lambda item: item[1]['fanout'],reverse=True)   # fanout排序的nets list
 buffer_name_idx = 1 
 buffer_name_idx = insert_buffer5_in_clk_net(clk_net, odb, block, buffer_master_list, buffer_idx,
-                             buffer_name_idx, _inst_center, _inst_size,max_per_group=7)
+                             buffer_name_idx, _inst_center, _inst_size,max_per_group=30)
 # for name,sorted_with_length_net_dict in sorted_with_length_nets[:20]:
 #     old_buffer_net = sorted_with_length_net_dict['net']
 #     net_ITerms = old_buffer_net.getITerms()
@@ -978,96 +1049,7 @@ max_disp_x = int(design.micronToDBU(4) / site.getWidth())
 max_disp_y = int(design.micronToDBU(4) / site.getHeight())
 design.getOpendp().detailedPlacement(max_disp_x, max_disp_y, "dpl_failures.txt",)
 # # ----------------------------detailed placement-------------------------------------
-design.evalTclString(f"estimate_parasitics -placement") 
-update_full_slacks(cellgraph, block, timing, corner)
-seed_tns = compute_tns_from_graph(cellgraph)
-print("First TNS =", seed_tns)
-N = 150
-for epoch in range(8):
-    print(f"\n=== Sizing ROUND {epoch+1}/8 ===")
-    a = 0
-    b = 0
-    # 1) 先刷新所有 node slack
-    update_full_slacks(cellgraph, block, timing, corner)
 
-    # 2) 重新找出负 slack 并排序
-    neg_nodes = [n for n in cellgraph.values() if n.features['slack'] < 0.0]
-    neg_nodes.sort(key=lambda n: n.features['slack'])
-    for i, node in enumerate(neg_nodes[:N]):
-        inst_name = node.name
-        inst = block.findInst(inst_name)
-        if not inst:
-            continue
-        old_master = inst.getMaster()
-        old_master_name = old_master.getName()
-        equivCells_masters = timing.equivCells(old_master)
-        equivCells_masters_names = [e.getName() for e in equivCells_masters]
-        # ========================== 使用 timing.equivCells 的邏輯 ==========================
-        idx = equivCells_masters_names.index(old_master_name)
-
-        # 3) 构造 upsizing 候选（往后找更大 drive‑strength）
-        cand_masters_names = []
-        for j in (idx-1,idx+2):
-            if 0 <= j < len(equivCells_masters_names) :
-                cand_masters_names.append(equivCells_masters_names[j])
-
-        # 如果没有更强的就跳过
-        if not cand_masters_names:
-            a += 1
-            continue
-        # ==============================================================================
-
-        best_tns_so_far = seed_tns
-        best_master_name_to_swap = None
-
-        for new_master_name in cand_masters_names:
-            # 需要從 cell name (string) 找到 master object
-            for equivCells_master in equivCells_masters:
-                if new_master_name == equivCells_master.getName():
-                    new_master = equivCells_master
-    
-            # 暫時應用 Sizing
-            inst.swapMaster(new_master)
-            design.evalTclString("estimate_parasitics -placement")
-            update_full_slacks(cellgraph,block,timing,corner)
-            design.evalTclString("report_tns")
-            new_tns = compute_tns_from_graph(cellgraph)
-            print(new_tns)
-
-            if new_tns > best_tns_so_far:
-                best_tns_so_far = new_tns
-                best_master_name_to_swap = new_master_name
-                best_master_to_swap = new_master
-
-            # 復原狀態
-            inst.swapMaster(old_master)
-
-        # 做出最終決定
-        if best_master_name_to_swap:
-            improvement = best_tns_so_far - seed_tns
-            
-            # 永久應用最佳的 Sizing
-            best_master = best_master_to_swap
-            inst.swapMaster(best_master)
-            design.evalTclString(f"estimate_parasitics -placement") 
-            update_full_slacks(cellgraph,block,timing,corner)
-            best_tns_so_far = compute_tns_from_graph(cellgraph)
-            print(f"[{i+1}/{N}] Sizing {inst_name}: {old_master_name} -> {best_master_name_to_swap}, New TNS: {best_tns_so_far:.4f}, ΔTNS: +{improvement:.4f}")
-
-            # 更新下一次迭代的基準 TNS
-            seed_tns = best_tns_so_far
-            
-        else:
-            print(f"[{i+1}/{N}] Sizing {inst_name}: No improvement found.")
-            b += 1
-            
-    N -= 20
-    print(a,b)
-    design.evalTclString(f"estimate_parasitics -placement")
-    update_full_slacks(cellgraph,block,timing,corner)
-    best_tns_so_far = compute_tns_from_graph(cellgraph)
-    print(best_tns_so_far) 
-# # --------------------------貪婪greeeeeeeeeedy結束----------------------------------
 after_centers = get_instance_centers(design)
 displacements = compute_displacements(before_centers, after_centers)
 # design.evalTclString("estimate_parasitics -placement")
