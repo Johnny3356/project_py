@@ -1138,7 +1138,42 @@ sorted_with_length_nets = sorted(nets_dict.items(),key=lambda item: item[1]['len
 sorted_critical_nets = sorted(net_criticality.items(), key=lambda item: item[1], reverse=True)
 
 inserted_net = [] 
+# # ----------------------------------------------------------------------
+timing.makeEquivCells()
+equivCells_masters = timing.equivCells(new_buffer_list[0].getMaster())
+design.evalTclString(f"estimate_parasitics -placement") 
+update_full_slacks(cellgraph, block, timing, corner)
+initial_tns = compute_tns_from_graph(cellgraph)
+best_tns = initial_tns
+current_tns = initial_tns
+initial_power = compute_power(block,timing,corner)
+print("after buffer TNS =", initial_tns)
+print("after buffer power =", initial_power)
 
+slack_nodes = []
+for new_buffer_list_cellgraph in new_buffer_list:
+    slack_nodes.append(cellgraph[new_buffer_list_cellgraph.getName()])
+neg_nodes = [n for n in slack_nodes if n.features['slack'] < 0.0]
+neg_nodes.sort(key=lambda n: n.features['slack'])
+new_buffer_list_sorted = [block.findInst(n.name)for n in neg_nodes]
+for new_bufferr in new_buffer_list_sorted[:50]:
+    new_buffer_master = new_bufferr.getMaster()
+    best_master = new_buffer_master
+    for equivCells_master in equivCells_masters:
+        new_bufferr.swapMaster(equivCells_master)
+        update_full_slacks(cellgraph, block, timing, corner)
+        current_tns = compute_tns_from_graph(cellgraph)
+        if current_tns > best_tns:
+            best_tns = current_tns
+            best_master = equivCells_master
+            print("found best master!",best_tns,best_master.getName())
+    new_bufferr.swapMaster(best_master)
+    # update_full_slacks(cellgraph, block, timing, corner)
+    # best_tns = compute_tns_from_graph(cellgraph) 
+    print(f"found best master!tns:{best_tns} name:{best_master.getName()}")
+    design.evalTclString("report_tns")   
+
+# # ----------------------------------------------------------------------
 # for name,sorted_with_length_net_dict in sorted_with_length_nets[:20]:
 #     old_buffer_net = sorted_with_length_net_dict['net']
 #     print(old_buffer_net.getName())
@@ -1193,7 +1228,7 @@ inserted_net = []
 
 design.evalTclString("estimate_parasitics -placement")
 update_full_slacks(cellgraph,block,timing,corner)
-print("after buffer tns:")
+print("after buffer+sizing tns:")
 design.evalTclString("report_tns")
 # # --------------------------------buffer list--------------------------------------
 
